@@ -1,0 +1,11 @@
+[package]
+name = "interdriver-usbip-client"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+interdriver-usbip-protocol = { path = "../usbip-protocol" }
+
+[lints]
+workspace = true

@@ -1,0 +1,31 @@
+[package]
+name = "interdriver-platform-macos"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "interdriver-macos-controller-probe"
+path = "src/bin/controller_probe.rs"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6.2"
+interdriver-usbip-client = { path = "../usbip-client" }
+interdriver-usbip-protocol = { path = "../usbip-protocol" }
+interdriver-usbip-server = { path = "../usbip-server" }
+interdriver-usbip-session = { path = "../usbip-session" }
+objc2 = "0.6.4"
+objc2-foundation = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "NSData",
+    "NSError",
+    "NSObject",
+    "NSString",
+] }
+signal-hook = "0.3.18"
+
+[lints.rust]
+unsafe_code = "allow"
+
+[lints.clippy]
+all = "warn"

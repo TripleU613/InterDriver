@@ -1,0 +1,17 @@
+[package]
+name = "interdriver-usb"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+interdriver-driver-core = { path = "../../crates/driver-core" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+interdriver-platform-linux = { path = "../../crates/platform-linux" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+interdriver-platform-macos = { path = "../../crates/platform-macos" }
+
+[lints]
+workspace = true

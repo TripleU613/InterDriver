@@ -1,0 +1,23 @@
+[workspace]
+members = [
+    "apps/interdriver-usb",
+    "crates/driver-core",
+    "crates/platform-linux",
+    "crates/platform-macos",
+    "crates/usbip-client",
+    "crates/usbip-protocol",
+    "crates/usbip-server",
+    "crates/usbip-session",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "warn"

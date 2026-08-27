@@ -1,0 +1,13 @@
+[package]
+name = "interdriver-platform-linux"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+interdriver-driver-core = { path = "../driver-core" }
+interdriver-usbip-client = { path = "../usbip-client" }
+signal-hook = "0.3.18"
+
+[lints]
+workspace = true
