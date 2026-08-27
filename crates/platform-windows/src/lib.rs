@@ -7,6 +7,9 @@ mod enumerate;
 mod install;
 
 #[cfg(target_os = "windows")]
+pub mod ude;
+
+#[cfg(target_os = "windows")]
 pub use install::install_root_device;
 
 #[cfg(target_os = "windows")]

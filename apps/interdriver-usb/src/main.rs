@@ -55,6 +55,10 @@ fn run(mut args: Vec<String>) -> Result<(), String> {
         [platform, command, inf] if platform == "windows" && command == "install-driver" => {
             windows_install_driver(inf)
         }
+        [platform, command, remote, bus_id] if platform == "windows" && command == "attach" => {
+            windows_attach(remote, bus_id, ticket)
+        }
+        [platform, command] if platform == "windows" && command == "detach" => windows_detach(),
         [platform, command, bus_id] if platform == "windows" && command == "export" => {
             windows_export(bus_id, DEFAULT_PORT)
         }
@@ -135,6 +139,8 @@ fn print_help() {
     println!("  interdriver-usb linux detach <port>");
     println!("  interdriver-usb windows list");
     println!("  interdriver-usb windows install-driver <inf-path>");
+    println!("  interdriver-usb windows attach <host> <bus-id> [--ticket <hex>]");
+    println!("  interdriver-usb windows detach");
     println!("  interdriver-usb windows export <bus-id> [port]");
     println!("  interdriver-usb macos attach <host> <bus-id>");
     println!("  interdriver-usb linux export <bus-id> [port] [--ticket <hex>]");
@@ -508,6 +514,98 @@ fn windows_install_driver(inf: &str) -> Result<(), String> {
 
 #[cfg(not(target_os = "windows"))]
 fn windows_install_driver(_inf: &str) -> Result<(), String> {
+    Err("Windows adapter is unavailable on this platform".into())
+}
+
+/// Imports a remote device and presents it on the virtual controller. The
+/// descriptors handed to the driver are the real device's own bytes, fetched
+/// over USB/IP, so Windows enumerates exactly what the far end reports.
+#[cfg(target_os = "windows")]
+fn windows_attach(remote: &str, bus_id: &str, ticket: Option<[u8; 32]>) -> Result<(), String> {
+    use interdriver_platform_windows::ude;
+
+    let imported = interdriver_usbip_client::import_with_ticket(
+        (remote, DEFAULT_PORT),
+        bus_id,
+        Duration::from_secs(10),
+        ticket,
+    )
+    .map_err(|error| error.to_string())?;
+    let speed = match imported.device.speed {
+        1 | 2 => ude::SPEED_FULL,
+        5 | 6 => ude::SPEED_SUPER,
+        _ => ude::SPEED_HIGH,
+    };
+    let session = Session::from_imported(imported).map_err(|error| error.to_string())?;
+
+    let device_descriptor = fetch_descriptor(&session, 1, 0, DEVICE_DESCRIPTOR_LEN as u16)?;
+    let header = fetch_descriptor(&session, 2, 0, 9)?;
+    if header.len() < 4 {
+        return Err("configuration descriptor header is too short".into());
+    }
+    let total = u16::from_le_bytes([header[2], header[3]]);
+    let config_descriptor = fetch_descriptor(&session, 2, 0, total)?;
+
+    ude::plug_in(None, speed, &device_descriptor, &config_descriptor)
+        .map_err(|error| error.to_string())?;
+    println!(
+        "attached {bus_id} from {remote}: {} byte device descriptor, {} byte configuration",
+        device_descriptor.len(),
+        config_descriptor.len()
+    );
+    println!("press Ctrl-C to detach");
+    loop {
+        std::thread::sleep(Duration::from_secs(3600));
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn fetch_descriptor(
+    session: &Session,
+    kind: u16,
+    index: u8,
+    length: u16,
+) -> Result<Vec<u8>, String> {
+    let value = (kind << 8) | u16::from(index);
+    let value_bytes = value.to_le_bytes();
+    let length_bytes = length.to_le_bytes();
+    let mut request = TransferRequest::input(0, usize::from(length));
+    request.setup = [
+        0x80,
+        0x06,
+        value_bytes[0],
+        value_bytes[1],
+        0,
+        0,
+        length_bytes[0],
+        length_bytes[1],
+    ];
+    let completion = session
+        .submit(request)
+        .map_err(|error| error.to_string())?
+        .wait_timeout(Duration::from_secs(10))
+        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())?;
+    if completion.status != 0 {
+        return Err(format!("descriptor request returned {}", completion.status));
+    }
+    Ok(completion.data)
+}
+
+#[cfg(target_os = "windows")]
+fn windows_detach() -> Result<(), String> {
+    interdriver_platform_windows::ude::unplug(None).map_err(|error| error.to_string())?;
+    println!("detached");
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn windows_attach(_r: &str, _b: &str, _t: Option<[u8; 32]>) -> Result<(), String> {
+    Err("Windows adapter is unavailable on this platform".into())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn windows_detach() -> Result<(), String> {
     Err("Windows adapter is unavailable on this platform".into())
 }
 

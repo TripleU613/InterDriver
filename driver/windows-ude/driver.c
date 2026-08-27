@@ -20,6 +20,8 @@
 typedef struct _GT_CONTROLLER {
     WDFDEVICE      Device;
     UDECXUSBDEVICE Child;
+    UDECXUSBENDPOINT Control;
+    WDFQUEUE       ControlQueue;
 } GT_CONTROLLER, *PGT_CONTROLLER;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(GT_CONTROLLER, GtControllerGet)
@@ -28,6 +30,13 @@ DRIVER_INITIALIZE DriverEntry;
 EVT_WDF_DRIVER_DEVICE_ADD GtEvtDeviceAdd;
 EVT_WDF_IO_QUEUE_IO_DEVICE_CONTROL GtEvtIoDeviceControl;
 EVT_UDECX_WDF_DEVICE_QUERY_USB_CAPABILITY GtEvtQueryUsbCapability;
+EVT_UDECX_USB_ENDPOINT_RESET GtEvtEndpointReset;
+EVT_UDECX_USB_DEVICE_D0_ENTRY GtEvtDeviceD0Entry;
+EVT_UDECX_USB_DEVICE_D0_EXIT GtEvtDeviceD0Exit;
+EVT_WDF_IO_QUEUE_IO_INTERNAL_DEVICE_CONTROL GtEvtControlUrb;
+
+static NTSTATUS GtPlugIn(_In_ PGT_CONTROLLER Controller, _In_ PINTERDRIVER_UDE_PLUG_IN_REQUEST Request);
+static NTSTATUS GtUnplug(_In_ PGT_CONTROLLER Controller);
 
 /*
  * UdeCx asks which optional host capabilities the controller supports. The
@@ -52,6 +61,195 @@ GtEvtQueryUsbCapability(
     return STATUS_NOT_IMPLEMENTED;
 }
 
+/*
+ * Endpoint 0 traffic. The user-mode service will drain these through an
+ * inverted call and answer them from the real device; until that is wired the
+ * requests are failed so the stack sees a definite answer rather than a hang.
+ */
+VOID
+GtEvtControlUrb(
+    _In_ WDFQUEUE Queue,
+    _In_ WDFREQUEST Request,
+    _In_ size_t OutputBufferLength,
+    _In_ size_t InputBufferLength,
+    _In_ ULONG IoControlCode
+    )
+{
+    UNREFERENCED_PARAMETER(Queue);
+    UNREFERENCED_PARAMETER(OutputBufferLength);
+    UNREFERENCED_PARAMETER(InputBufferLength);
+    UNREFERENCED_PARAMETER(IoControlCode);
+
+    UdecxUrbCompleteWithNtStatus(Request, STATUS_NOT_IMPLEMENTED);
+}
+
+VOID
+GtEvtEndpointReset(
+    _In_ UDECXUSBENDPOINT Endpoint,
+    _In_ WDFREQUEST Request
+    )
+{
+    UNREFERENCED_PARAMETER(Endpoint);
+    WdfRequestComplete(Request, STATUS_SUCCESS);
+}
+
+NTSTATUS
+GtEvtDeviceD0Entry(
+    _In_ WDFDEVICE UdecxWdfDevice,
+    _In_ UDECXUSBDEVICE UdecxUsbDevice
+    )
+{
+    UNREFERENCED_PARAMETER(UdecxWdfDevice);
+    UdecxUsbDeviceLinkPowerEntryComplete(UdecxUsbDevice, STATUS_SUCCESS);
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS
+GtEvtDeviceD0Exit(
+    _In_ WDFDEVICE UdecxWdfDevice,
+    _In_ UDECXUSBDEVICE UdecxUsbDevice,
+    _In_ UDECX_USB_DEVICE_WAKE_SETTING WakeSetting
+    )
+{
+    UNREFERENCED_PARAMETER(UdecxWdfDevice);
+    UNREFERENCED_PARAMETER(WakeSetting);
+    UdecxUsbDeviceLinkPowerExitComplete(UdecxUsbDevice, STATUS_SUCCESS);
+    return STATUS_SUCCESS;
+}
+
+
+/*
+ * Creates the emulated device from descriptors captured off the real device and
+ * attaches it to the root port. Windows enumerates from these descriptors, so
+ * the device appears without any endpoint traffic.
+ */
+static NTSTATUS
+GtPlugIn(
+    _In_ PGT_CONTROLLER Controller,
+    _In_ PINTERDRIVER_UDE_PLUG_IN_REQUEST Request
+    )
+{
+    NTSTATUS status;
+    PUDECXUSBDEVICE_INIT init = NULL;
+    UDECX_USB_DEVICE_STATE_CHANGE_CALLBACKS callbacks;
+    UDECX_USB_DEVICE_PLUG_IN_OPTIONS options;
+    UDECX_USB_ENDPOINT_CALLBACKS endpointCallbacks;
+    PUDECXUSBENDPOINT_INIT endpointInit = NULL;
+    WDF_IO_QUEUE_CONFIG queueConfig;
+    WDF_OBJECT_ATTRIBUTES attributes;
+    UDECX_USB_DEVICE_SPEED speed;
+    PUCHAR bytes;
+
+    if (Controller->Child != NULL) {
+        return STATUS_DEVICE_ALREADY_ATTACHED;
+    }
+
+    switch (Request->Speed) {
+    case INTERDRIVER_UDE_SPEED_FULL:  speed = UdecxUsbFullSpeed;  break;
+    case INTERDRIVER_UDE_SPEED_SUPER: speed = UdecxUsbSuperSpeed; break;
+    default:                      speed = UdecxUsbHighSpeed;  break;
+    }
+
+    init = UdecxUsbDeviceInitAllocate(Controller->Device);
+    if (init == NULL) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    UdecxUsbDeviceInitSetSpeed(init, speed);
+    UdecxUsbDeviceInitSetEndpointsType(init, UdecxEndpointTypeSimple);
+
+    bytes = (PUCHAR)(Request + 1);
+    status = UdecxUsbDeviceInitAddDescriptor(init, bytes, Request->DeviceDescriptorLength);
+    if (!NT_SUCCESS(status)) {
+        goto fail;
+    }
+    bytes += Request->DeviceDescriptorLength;
+    status = UdecxUsbDeviceInitAddDescriptor(init, bytes, Request->ConfigDescriptorLength);
+    if (!NT_SUCCESS(status)) {
+        goto fail;
+    }
+
+    UDECX_USB_DEVICE_CALLBACKS_INIT(&callbacks);
+    callbacks.EvtUsbDeviceLinkPowerEntry = GtEvtDeviceD0Entry;
+    callbacks.EvtUsbDeviceLinkPowerExit = GtEvtDeviceD0Exit;
+    UdecxUsbDeviceInitSetStateChangeCallbacks(init, &callbacks);
+
+    status = UdecxUsbDeviceCreate(&init, WDF_NO_OBJECT_ATTRIBUTES, &Controller->Child);
+    if (!NT_SUCCESS(status)) {
+        goto fail;
+    }
+    init = NULL;
+
+    WDF_IO_QUEUE_CONFIG_INIT(&queueConfig, WdfIoQueueDispatchParallel);
+    queueConfig.EvtIoInternalDeviceControl = GtEvtControlUrb;
+    WDF_OBJECT_ATTRIBUTES_INIT(&attributes);
+    attributes.ParentObject = Controller->Child;
+    status = WdfIoQueueCreate(Controller->Device, &queueConfig, &attributes,
+                              &Controller->ControlQueue);
+    if (!NT_SUCCESS(status)) {
+        goto fail;
+    }
+
+    endpointInit = UdecxUsbSimpleEndpointInitAllocate(Controller->Child);
+    if (endpointInit == NULL) {
+        status = STATUS_INSUFFICIENT_RESOURCES;
+        goto fail;
+    }
+    UdecxUsbEndpointInitSetEndpointAddress(endpointInit, USB_DEFAULT_ENDPOINT_ADDRESS);
+    UDECX_USB_ENDPOINT_CALLBACKS_INIT(&endpointCallbacks, GtEvtEndpointReset);
+    UdecxUsbEndpointInitSetCallbacks(endpointInit, &endpointCallbacks);
+
+    status = UdecxUsbEndpointCreate(&endpointInit, WDF_NO_OBJECT_ATTRIBUTES,
+                                    &Controller->Control);
+    if (!NT_SUCCESS(status)) {
+        goto fail;
+    }
+    endpointInit = NULL;
+    UdecxUsbEndpointSetWdfIoQueue(Controller->Control, Controller->ControlQueue);
+
+    UDECX_USB_DEVICE_PLUG_IN_OPTIONS_INIT(&options);
+    if (speed == UdecxUsbSuperSpeed) {
+        options.Usb30PortNumber = 1;
+    } else {
+        options.Usb20PortNumber = 1;
+    }
+
+    status = UdecxUsbDevicePlugIn(Controller->Child, &options);
+    if (!NT_SUCCESS(status)) {
+        goto fail;
+    }
+    return STATUS_SUCCESS;
+
+fail:
+    if (endpointInit != NULL) {
+        UdecxUsbEndpointInitFree(endpointInit);
+    }
+    if (init != NULL) {
+        UdecxUsbDeviceInitFree(init);
+    }
+    if (Controller->Child != NULL) {
+        WdfObjectDelete(Controller->Child);
+        Controller->Child = NULL;
+    }
+    return status;
+}
+
+static NTSTATUS
+GtUnplug(
+    _In_ PGT_CONTROLLER Controller
+    )
+{
+    NTSTATUS status;
+
+    if (Controller->Child == NULL) {
+        return STATUS_DEVICE_NOT_CONNECTED;
+    }
+    status = UdecxUsbDevicePlugOutAndDelete(Controller->Child);
+    Controller->Child = NULL;
+    Controller->Control = NULL;
+    return status;
+}
+
 VOID
 GtEvtIoDeviceControl(
     _In_ WDFQUEUE Queue,
@@ -65,16 +263,34 @@ GtEvtIoDeviceControl(
     UNREFERENCED_PARAMETER(OutputBufferLength);
     UNREFERENCED_PARAMETER(InputBufferLength);
 
+    PGT_CONTROLLER controller = GtControllerGet(WdfIoQueueGetDevice(Queue));
+    NTSTATUS status;
+    PINTERDRIVER_UDE_PLUG_IN_REQUEST plug;
+    size_t length;
+
     switch (IoControlCode) {
     case IOCTL_INTERDRIVER_UDE_PLUG_IN:
+        status = WdfRequestRetrieveInputBuffer(Request, sizeof(*plug), (PVOID *)&plug, &length);
+        if (!NT_SUCCESS(status)) {
+            break;
+        }
+        if (plug->DeviceDescriptorLength > INTERDRIVER_UDE_MAX_DESCRIPTOR ||
+            plug->ConfigDescriptorLength > INTERDRIVER_UDE_MAX_DESCRIPTOR ||
+            length < sizeof(*plug) + plug->DeviceDescriptorLength +
+                     plug->ConfigDescriptorLength) {
+            status = STATUS_INVALID_BUFFER_SIZE;
+            break;
+        }
+        status = GtPlugIn(controller, plug);
+        break;
     case IOCTL_INTERDRIVER_UDE_UNPLUG:
-        /* Device plug-in lands here once the user-mode service drives it. */
-        WdfRequestComplete(Request, STATUS_NOT_IMPLEMENTED);
+        status = GtUnplug(controller);
         break;
     default:
-        WdfRequestComplete(Request, STATUS_INVALID_DEVICE_REQUEST);
+        status = STATUS_INVALID_DEVICE_REQUEST;
         break;
     }
+    WdfRequestComplete(Request, status);
 }
 
 NTSTATUS

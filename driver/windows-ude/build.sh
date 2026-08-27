@@ -40,9 +40,9 @@ lld-link \
   /BASE:0x1C0000000 /DYNAMICBASE /NXCOMPAT /TSAWARE:NO /RELEASE \
   /ALIGN:0x1000 /FILEALIGN:0x1000 \
   /SECTION:.text,ERP /SECTION:.rdata,RP /SECTION:.data,RWP /SECTION:.pdata,RP \
-  /MERGE:_guard_check_icall_=.rdata \
-  /MERGE:_guard_dispatch_icall_=.rdata \
-  /MERGE:memset_=.rdata \
+  /MERGE:_guard_check_icall_=.data \
+  /MERGE:_guard_dispatch_icall_=.data \
+  /MERGE:memset_=.data \
   /LIBPATH:"$WDK/Lib/$SDKVER/km/x64" \
   /LIBPATH:"$WDK/Lib/$SDKVER/km/x64/ude/1.0" \
   /LIBPATH:"$WDK/Lib/wdf/kmdf/x64/$KMDF" \

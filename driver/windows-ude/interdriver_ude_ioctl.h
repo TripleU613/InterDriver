@@ -22,9 +22,18 @@ DEFINE_GUID(GUID_DEVINTERFACE_INTERDRIVER_UDE,
 #define INTERDRIVER_UDE_SPEED_HIGH  2
 #define INTERDRIVER_UDE_SPEED_SUPER 3
 
+/*
+ * Followed in the same buffer by DeviceDescriptorLength bytes of device
+ * descriptor and then ConfigDescriptorLength bytes of configuration
+ * descriptor, both taken verbatim from the real remote device.
+ */
 typedef struct _INTERDRIVER_UDE_PLUG_IN_REQUEST {
     unsigned long Size;
     unsigned long Speed;
+    unsigned long DeviceDescriptorLength;
+    unsigned long ConfigDescriptorLength;
 } INTERDRIVER_UDE_PLUG_IN_REQUEST, *PINTERDRIVER_UDE_PLUG_IN_REQUEST;
+
+#define INTERDRIVER_UDE_MAX_DESCRIPTOR 4096
 
 #endif /* INTERDRIVER_UDE_IOCTL_H */

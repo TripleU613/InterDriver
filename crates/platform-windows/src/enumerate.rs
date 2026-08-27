@@ -83,6 +83,36 @@ pub fn list_devices() -> io::Result<Vec<FoundDevice>> {
     Ok(devices)
 }
 
+/// First device-interface path registered for `guid`, if any. Used to find
+/// singleton interfaces such as the virtual controller.
+pub fn first_interface_path(guid: &GUID) -> io::Result<Option<String>> {
+    let handle = unsafe {
+        SetupDiGetClassDevsW(
+            guid,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            DIGCF_PRESENT | DIGCF_DEVICEINTERFACE,
+        )
+    };
+    if handle == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    let list = DeviceInfoList(handle);
+    let mut interface = SP_DEVICE_INTERFACE_DATA {
+        cbSize: size_of::<SP_DEVICE_INTERFACE_DATA>() as u32,
+        InterfaceClassGuid: *guid,
+        Flags: 0,
+        Reserved: 0,
+    };
+    let found = unsafe {
+        SetupDiEnumDeviceInterfaces(list.0, std::ptr::null(), guid, 0, &mut interface)
+    };
+    if found == 0 {
+        return Ok(None);
+    }
+    interface_path(list.0, &mut interface)
+}
+
 fn list_by_class(class: &'static str, guid: &GUID) -> io::Result<Vec<FoundDevice>> {
     let handle = unsafe {
         SetupDiGetClassDevsW(
