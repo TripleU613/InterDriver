@@ -35,6 +35,30 @@ Two things make the cross-build work:
 KMDF version directories are incremental, so both the target version and an
 older complete one are on the include path.
 
+## PE requirements the kernel enforces
+
+Getting a cross-built image to load took matching several fields MSVC sets and
+lld-link does not by default. All are in `build.sh`; the decisive one is last:
+
+| flag | why |
+| --- | --- |
+| `/ALIGN:0x1000 /FILEALIGN:0x1000` | kernel images are page-aligned in the file |
+| `/RELEASE` | writes the PE checksum, which the loader validates |
+| `/SUBSYSTEM:NATIVE,10.00 /OSVERSION:10.0` | default 6.00 is rejected |
+| `/SECTION:...,P` | sections must be non-pageable, as MSVC marks them |
+| `/MERGE:_guard_*=.rdata` | folds hotpatch metadata lld leaves unreadable |
+| **`/BASE:0x1C0000000`** | **a kernel image cannot prefer a user-space base** |
+
+The last one is the whole ballgame. With `/BASE:0x10000` every load fails with
+`STATUS_CONFLICTING_ADDRESSES` (ERROR_INVALID_ADDRESS, 487) no matter what else
+is correct, because the preferred base lies in user address space. It was found
+by bisecting with a minimal ntoskrnl-only driver and diffing every optional
+header field against Microsoft's `udecx.sys`.
+
+Note `pnputil` deduplicates by `DriverVer`, so replacing the binary requires
+`/delete-driver <oemNN.inf> /uninstall /force` first or the DriverStore keeps
+serving the old image.
+
 ## Loading it
 
 The driver is self-signed for development. Secure Boot is off on the test box,

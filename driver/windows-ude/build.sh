@@ -35,9 +35,9 @@ clang-cl --target=x86_64-pc-windows-msvc \
 
 lld-link \
   /OUT:"$OUT/interdriver-ude.sys" \
-  /DRIVER /SUBSYSTEM:NATIVE /ENTRY:FxDriverEntry /NODEFAULTLIB \
+  /DRIVER /SUBSYSTEM:NATIVE,10.00 /OSVERSION:10.0 /ENTRY:FxDriverEntry /NODEFAULTLIB \
   /MACHINE:X64 /DEBUG /MAP:"$OUT/interdriver-ude.map" \
-  /BASE:0x10000 /DYNAMICBASE /NXCOMPAT /RELEASE \
+  /BASE:0x1C0000000 /DYNAMICBASE /NXCOMPAT /TSAWARE:NO /RELEASE \
   /ALIGN:0x1000 /FILEALIGN:0x1000 \
   /SECTION:.text,ERP /SECTION:.rdata,RP /SECTION:.data,RWP /SECTION:.pdata,RP \
   /MERGE:_guard_check_icall_=.rdata \
