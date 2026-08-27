@@ -8,7 +8,8 @@
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject};
 use block2::DynBlock;
-use objc2::{AnyThread, extern_class, msg_send};
+use objc2::runtime::Sel;
+use objc2::{AnyThread, extern_class, msg_send, sel};
 use objc2_foundation::NSError;
 use std::ffi::{CString, c_char, c_void};
 
@@ -82,6 +83,51 @@ fn read_u16_property(service: IoObject, key: &str) -> Option<u16> {
     }
 }
 
+/// Reads a descriptor straight off the device.
+///
+/// `descriptorWithType:length:index:languageID:error:` returns a pointer to a
+/// packed descriptor, and objc2's encoding check rejects a `*const u8` return
+/// against the framework's struct-pointer encoding, so the selector is invoked
+/// through `objc_msgSend` directly.
+fn read_descriptor(
+    device: &IOUSBHostDevice,
+    kind: usize,
+    index: usize,
+    want: usize,
+) -> Option<Vec<u8>> {
+    type Fn = unsafe extern "C" fn(
+        *const IOUSBHostDevice,
+        Sel,
+        usize,
+        *mut usize,
+        usize,
+        usize,
+        *mut *mut NSError,
+    ) -> *const u8;
+    unsafe {
+        let send: Fn = std::mem::transmute(objc_msgSend as *const c_void);
+        let mut length: usize = want;
+        let mut error: *mut NSError = std::ptr::null_mut();
+        let bytes = send(
+            device,
+            sel!(descriptorWithType:length:index:languageID:error:),
+            kind,
+            &mut length,
+            index,
+            0,
+            &mut error,
+        );
+        if bytes.is_null() || length == 0 || length > 4096 {
+            return None;
+        }
+        Some(std::slice::from_raw_parts(bytes, length).to_vec())
+    }
+}
+
+unsafe extern "C" {
+    fn objc_msgSend();
+}
+
 pub fn probe_export() -> Result<String, String> {
     unsafe {
         let class_name = CString::new("IOUSBHostDevice").unwrap();
@@ -120,8 +166,29 @@ pub fn probe_export() -> Result<String, String> {
                 Some(device) => {
                     let pid = read_u16_property(service, "idProduct").unwrap_or(0);
                     report.push_str(&format!(
-                        "EXCLUSIVE OPEN OK: {APPLE_VENDOR_ID:04x}:{pid:04x}                          — userspace took exclusive ownership; macOS export is viable\n"
+                        "EXCLUSIVE OPEN OK: {APPLE_VENDOR_ID:04x}:{pid:04x}\n"
                     ));
+                    match read_descriptor(&device, 1, 0, 18) {
+                        Some(bytes) => report.push_str(&format!(
+                            "device descriptor: {} bytes {:02x?}\n",
+                            bytes.len(),
+                            &bytes[..bytes.len().min(18)]
+                        )),
+                        None => report.push_str("device descriptor: FAILED\n"),
+                    }
+                    match read_descriptor(&device, 2, 0, 9) {
+                        Some(header) if header.len() >= 4 => {
+                            let total = usize::from(u16::from_le_bytes([header[2], header[3]]));
+                            match read_descriptor(&device, 2, 0, total) {
+                                Some(full) => report.push_str(&format!(
+                                    "configuration descriptor: {} bytes (total {total})\n",
+                                    full.len()
+                                )),
+                                None => report.push_str("configuration descriptor: FAILED\n"),
+                            }
+                        }
+                        _ => report.push_str("configuration header: FAILED\n"),
+                    }
                     let _: () = msg_send![&*device, destroy];
                 }
                 None => {

@@ -102,6 +102,25 @@ Still to wire: transport (carry USB/IP inside mutually authenticated TLS/QUIC),
 and authenticating the operator to the broker (today the ISSUE verb is
 unauthenticated — do not expose the broker port off a trusted network).
 
+## macOS Export — capture and descriptors working on hardware
+
+Beyond the exclusive-ownership probe, the exporter now reads real descriptors
+off the attached iPhone through `descriptorWithType:length:index:languageID:`,
+which issues genuine GET_DESCRIPTOR control requests:
+
+```
+EXCLUSIVE OPEN OK: 05ac:12a8
+device descriptor: 18 bytes [12 01 00 02 00 00 00 40 ac 05 a8 12 01 10 01 02 03 05]
+configuration descriptor: 39 bytes (total 39)
+```
+
+VID/PID/bcdDevice/configuration-count all match `mac-device-groundtruth.md`.
+Control transfers therefore work; what remains for a full `DeviceProvider` is
+bulk and interrupt traffic through `IOUSBHostPipe`.
+
+Note objc2 rejects a `*const u8` return against the framework's struct-pointer
+encoding, so the selector is invoked through `objc_msgSend` directly.
+
 ## macOS Export — VIABLE (probe proven on hardware)
 
 `interdriver-macos-export-probe` (in `platform-macos`) took **exclusive ownership**
