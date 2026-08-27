@@ -1,4 +1,5 @@
-use interdriver_usbip_protocol::{
+use interdriver_usbip_protocol::{TICKET_MAGIC,
+
     BUS_ID_LEN, CONTROL_HEADER_LEN, ControlHeader, DEVICE_RECORD_LEN, DeviceRecord,
     INTERFACE_RECORD_LEN, ImportRequest, InterfaceRecord, OP_REP_DEVLIST, OP_REP_IMPORT,
     OP_REQ_DEVLIST, OP_REQ_IMPORT,
@@ -108,7 +109,15 @@ impl From<interdriver_usbip_protocol::EncodeError> for Error {
 }
 
 pub fn list<A: ToSocketAddrs>(address: A, timeout: Duration) -> Result<Vec<ListedDevice>, Error> {
-    let mut stream = connect(address, timeout)?;
+    list_with_ticket(address, timeout, None)
+}
+
+pub fn list_with_ticket<A: ToSocketAddrs>(
+    address: A,
+    timeout: Duration,
+    ticket: Option<[u8; 32]>,
+) -> Result<Vec<ListedDevice>, Error> {
+    let mut stream = connect(address, timeout, ticket)?;
     stream.write_all(
         &ControlHeader {
             code: OP_REQ_DEVLIST,
@@ -146,7 +155,16 @@ pub fn import<A: ToSocketAddrs>(
     bus_id: &str,
     timeout: Duration,
 ) -> Result<ImportedDevice, Error> {
-    let mut stream = connect(address, timeout)?;
+    import_with_ticket(address, bus_id, timeout, None)
+}
+
+pub fn import_with_ticket<A: ToSocketAddrs>(
+    address: A,
+    bus_id: &str,
+    timeout: Duration,
+    ticket: Option<[u8; 32]>,
+) -> Result<ImportedDevice, Error> {
+    let mut stream = connect(address, timeout, ticket)?;
     stream.write_all(
         &ControlHeader {
             code: OP_REQ_IMPORT,
@@ -167,7 +185,11 @@ pub fn import<A: ToSocketAddrs>(
     Ok(ImportedDevice { device, stream })
 }
 
-fn connect<A: ToSocketAddrs>(address: A, timeout: Duration) -> Result<TcpStream, Error> {
+fn connect<A: ToSocketAddrs>(
+    address: A,
+    timeout: Duration,
+    ticket: Option<[u8; 32]>,
+) -> Result<TcpStream, Error> {
     let addresses: Vec<SocketAddr> = address.to_socket_addrs()?.collect();
     if addresses.is_empty() {
         return Err(Error::AddressUnavailable);
@@ -175,10 +197,14 @@ fn connect<A: ToSocketAddrs>(address: A, timeout: Duration) -> Result<TcpStream,
     let mut last_error = None;
     for address in addresses {
         match TcpStream::connect_timeout(&address, timeout) {
-            Ok(stream) => {
+            Ok(mut stream) => {
                 stream.set_nodelay(true)?;
                 stream.set_read_timeout(Some(timeout))?;
                 stream.set_write_timeout(Some(timeout))?;
+                if let Some(token) = ticket {
+                    stream.write_all(&TICKET_MAGIC)?;
+                    stream.write_all(&token)?;
+                }
                 return Ok(stream);
             }
             Err(error) => last_error = Some(error),

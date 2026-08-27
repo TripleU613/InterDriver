@@ -71,6 +71,7 @@ dependencies = [
 name = "interdriver-usb"
 version = "0.1.0"
 dependencies = [
+ "interdriver-control-plane",
  "interdriver-driver-core",
  "interdriver-platform-linux",
  "interdriver-platform-macos",

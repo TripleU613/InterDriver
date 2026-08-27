@@ -17,7 +17,8 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(args: Vec<String>) -> Result<(), String> {
+fn run(mut args: Vec<String>) -> Result<(), String> {
+    let ticket = take_ticket(&mut args)?;
     match args.as_slice() {
         [command] if command == "matrix" => {
             print_matrix();
@@ -61,15 +62,15 @@ fn run(args: Vec<String>) -> Result<(), String> {
         [platform, command, remote, bus_id] if platform == "macos" && command == "attach" => {
             macos_attach(remote, bus_id)
         }
-        [command, remote, bus_id] if command == "probe" => probe(remote, bus_id),
+        [command, remote, bus_id] if command == "probe" => probe(remote, bus_id, ticket),
         [platform, command, bus_id] if platform == "linux" && command == "export" => {
-            linux_export(bus_id, DEFAULT_PORT)
+            linux_export(bus_id, DEFAULT_PORT, ticket)
         }
         [platform, command, bus_id, port] if platform == "linux" && command == "export" => {
             let port = port
                 .parse::<u16>()
                 .map_err(|_| "port must be an integer from 1 to 65535".to_string())?;
-            linux_export(bus_id, port)
+            linux_export(bus_id, port, ticket)
         }
         [] => {
             print_help();
@@ -107,13 +108,28 @@ fn print_help() {
     println!("  interdriver-usb windows list");
     println!("  interdriver-usb windows export <bus-id> [port]");
     println!("  interdriver-usb macos attach <host> <bus-id>");
-    println!("  interdriver-usb linux export <bus-id> [port]");
-    println!("  interdriver-usb probe <host> <bus-id>");
+    println!("  interdriver-usb linux export <bus-id> [port] [--ticket <hex>]");
+    println!("  interdriver-usb probe <host> <bus-id> [--ticket <hex>]");
 }
 
-fn probe(remote: &str, bus_id: &str) -> Result<(), String> {
-    let session = Session::connect((remote, DEFAULT_PORT), bus_id, Duration::from_secs(10))
-        .map_err(|error| error.to_string())?;
+fn take_ticket(args: &mut Vec<String>) -> Result<Option<[u8; 32]>, String> {
+    let Some(index) = args.iter().position(|arg| arg == "--ticket") else {
+        return Ok(None);
+    };
+    let hex = args
+        .get(index + 1)
+        .ok_or_else(|| "--ticket needs a 64-character hex token".to_string())?
+        .clone();
+    let token = interdriver_control_plane::Token::from_hex(&hex)
+        .ok_or_else(|| "--ticket must be 64 hex characters".to_string())?;
+    args.drain(index..=index + 1);
+    Ok(Some(token.as_bytes()))
+}
+
+fn probe(remote: &str, bus_id: &str, ticket: Option<[u8; 32]>) -> Result<(), String> {
+    let session =
+        Session::connect_with_ticket((remote, DEFAULT_PORT), bus_id, Duration::from_secs(10), ticket)
+            .map_err(|error| error.to_string())?;
     let mut request = TransferRequest::input(0, DEVICE_DESCRIPTOR_LEN);
     request.setup = [0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 0x12, 0x00];
     let completion = session
@@ -150,7 +166,17 @@ fn probe(remote: &str, bus_id: &str) -> Result<(), String> {
 }
 
 #[cfg(target_os = "linux")]
-fn linux_export(bus_id: &str, port: u16) -> Result<(), String> {
+struct FixedTicket(interdriver_control_plane::Token);
+
+#[cfg(target_os = "linux")]
+impl interdriver_usbip_server::Authorizer for FixedTicket {
+    fn authorize(&self, token: &[u8; 32]) -> bool {
+        self.0 == interdriver_control_plane::Token::from_bytes(*token)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_export(bus_id: &str, port: u16, ticket: Option<[u8; 32]>) -> Result<(), String> {
     use std::net::TcpListener;
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
@@ -160,8 +186,17 @@ fn linux_export(bus_id: &str, port: u16) -> Result<(), String> {
         TcpListener::bind(("0.0.0.0", port)).map_err(|error| format!("bind {port}: {error}"))?;
     let shutdown = Arc::new(AtomicBool::new(false));
     signal_flag(&shutdown)?;
-    eprintln!("exporting {bus_id} from usbfs on port {port}; press Ctrl-C to stop");
-    interdriver_usbip_server::serve(listener, provider, shutdown).map_err(|error| error.to_string())
+    let authorizer: Option<Arc<dyn interdriver_usbip_server::Authorizer>> = ticket.map(|token| {
+        Arc::new(FixedTicket(interdriver_control_plane::Token::from_bytes(token)))
+            as Arc<dyn interdriver_usbip_server::Authorizer>
+    });
+    if authorizer.is_some() {
+        eprintln!("exporting {bus_id} from usbfs on port {port} (ticket required); Ctrl-C to stop");
+    } else {
+        eprintln!("exporting {bus_id} from usbfs on port {port}; press Ctrl-C to stop");
+    }
+    interdriver_usbip_server::serve_authorized(listener, provider, shutdown, authorizer)
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(target_os = "linux")]
@@ -184,7 +219,7 @@ const fn libc_sigterm() -> i32 {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn linux_export(_bus_id: &str, _port: u16) -> Result<(), String> {
+fn linux_export(_bus_id: &str, _port: u16, _ticket: Option<[u8; 32]>) -> Result<(), String> {
     Err("Linux adapter is unavailable on this platform".into())
 }
 

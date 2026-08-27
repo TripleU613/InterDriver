@@ -64,9 +64,23 @@ fully unit-tested (13 tests), no external crypto deps:
 - `Token` compares in constant time and never appears in Debug output.
 
 Time is injected as unix seconds (no ambient clock) so the logic is
-deterministic. Still to wire: transport (carry USB/IP inside mutually
-authenticated TLS/QUIC) and binding the broker into the exporter/importer CLIs
-so a session ticket actually gates a data connection.
+deterministic.
+
+## Ticket-Gated Data Plane (verified on hardware)
+
+The ticket now gates the actual USB/IP connection. Before the USB/IP control
+request, an importer may send `TICKET_MAGIC` ("GTKT") + a 32-byte token; the
+magic cannot collide with a USB/IP header (whose first bytes are version
+0x0111), so a ticketed exporter cleanly rejects a plain kernel usbip client.
+`serve_authorized` takes an `Authorizer`; `interdriver-usb linux export <bus> [port]
+--ticket <hex>` requires the token, `interdriver-usb probe <host> <bus> --ticket
+<hex>` presents it. Verified with a real webcam: correct ticket returns the
+device descriptor, wrong ticket and no ticket are both dropped before any device
+is touched.
+
+Still to wire: transport (carry USB/IP inside mutually authenticated TLS/QUIC),
+and connecting the exporter's `Authorizer` to a live `Broker` over the network
+instead of a single pre-shared token.
 
 ## Not Yet Written
 

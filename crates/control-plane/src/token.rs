@@ -22,6 +22,11 @@ impl Token {
     }
 
     #[must_use]
+    pub fn as_bytes(&self) -> [u8; 32] {
+        self.0
+    }
+
+    #[must_use]
     pub fn to_hex(&self) -> String {
         let mut out = String::with_capacity(64);
         for byte in self.0 {

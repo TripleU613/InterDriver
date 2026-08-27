@@ -1,4 +1,5 @@
-use interdriver_usbip_protocol::{
+use interdriver_usbip_protocol::{TICKET_LEN, TICKET_MAGIC,
+
     BUS_ID_LEN, BasicHeader, CONTROL_HEADER_LEN, Command, ControlHeader, DEVICE_RECORD_LEN,
     Direction, INTERFACE_RECORD_LEN, ISO_DESCRIPTOR_LEN, ImportRequest, InterfaceRecord,
     IsoPacketDescriptor, OP_REP_DEVLIST, OP_REP_IMPORT, OP_REQ_DEVLIST, OP_REQ_IMPORT, Submit,
@@ -55,20 +56,37 @@ pub trait DeviceProvider: Send + Sync + 'static {
     fn open(&self, bus_id: &str) -> io::Result<Arc<dyn DeviceSession>>;
 }
 
+/// Gate on the session ticket presented before the USB/IP request. The exporter
+/// consults the control plane through this; a `false` verdict drops the
+/// connection before any device is touched.
+pub trait Authorizer: Send + Sync + 'static {
+    fn authorize(&self, token: &[u8; TICKET_LEN]) -> bool;
+}
+
 pub fn serve(
     listener: TcpListener,
     provider: Arc<dyn DeviceProvider>,
     shutdown: Arc<AtomicBool>,
+) -> io::Result<()> {
+    serve_authorized(listener, provider, shutdown, None)
+}
+
+pub fn serve_authorized(
+    listener: TcpListener,
+    provider: Arc<dyn DeviceProvider>,
+    shutdown: Arc<AtomicBool>,
+    authorizer: Option<Arc<dyn Authorizer>>,
 ) -> io::Result<()> {
     listener.set_nonblocking(true)?;
     while !shutdown.load(Ordering::Acquire) {
         match listener.accept() {
             Ok((stream, _)) => {
                 let provider = Arc::clone(&provider);
+                let authorizer = authorizer.clone();
                 thread::Builder::new()
                     .name("interdriver-usbip-server".into())
                     .spawn(move || {
-                        let _ = serve_connection(stream, provider);
+                        let _ = serve_connection_authorized(stream, provider, authorizer);
                     })?;
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
@@ -81,10 +99,30 @@ pub fn serve(
 }
 
 pub fn serve_connection(
-    mut stream: TcpStream,
+    stream: TcpStream,
     provider: Arc<dyn DeviceProvider>,
 ) -> io::Result<()> {
+    serve_connection_authorized(stream, provider, None)
+}
+
+pub fn serve_connection_authorized(
+    mut stream: TcpStream,
+    provider: Arc<dyn DeviceProvider>,
+    authorizer: Option<Arc<dyn Authorizer>>,
+) -> io::Result<()> {
     stream.set_nodelay(true)?;
+    if let Some(authorizer) = authorizer {
+        let mut magic = [0_u8; TICKET_MAGIC.len()];
+        stream.read_exact(&mut magic)?;
+        if magic != TICKET_MAGIC {
+            return Err(invalid_data("session ticket required"));
+        }
+        let mut token = [0_u8; TICKET_LEN];
+        stream.read_exact(&mut token)?;
+        if !authorizer.authorize(&token) {
+            return Err(invalid_data("session ticket rejected"));
+        }
+    }
     let request = read_control_header(&mut stream)?;
     match request.code {
         OP_REQ_DEVLIST => send_device_list(&mut stream, provider.as_ref()),

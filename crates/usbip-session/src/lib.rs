@@ -211,7 +211,16 @@ impl Session {
         bus_id: &str,
         timeout: Duration,
     ) -> Result<Self, Error> {
-        let imported = interdriver_usbip_client::import(address, bus_id, timeout)?;
+        Self::connect_with_ticket(address, bus_id, timeout, None)
+    }
+
+    pub fn connect_with_ticket<A: ToSocketAddrs>(
+        address: A,
+        bus_id: &str,
+        timeout: Duration,
+        ticket: Option<[u8; 32]>,
+    ) -> Result<Self, Error> {
+        let imported = interdriver_usbip_client::import_with_ticket(address, bus_id, timeout, ticket)?;
         Self::from_imported(imported)
     }
 

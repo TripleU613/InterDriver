@@ -3,6 +3,13 @@
 use core::fmt;
 
 pub const VERSION: u16 = 0x0111;
+
+/// InterDriver session-ticket pre-handshake. When an exporter requires a ticket the
+/// importer sends `TICKET_MAGIC` followed by a 32-byte token before the USB/IP
+/// control request. The magic never collides with a USB/IP control header,
+/// whose first two bytes are always the version `0x0111`.
+pub const TICKET_MAGIC: [u8; 4] = *b"GTKT";
+pub const TICKET_LEN: usize = 32;
 pub const CONTROL_HEADER_LEN: usize = 8;
 pub const BUS_ID_LEN: usize = 32;
 pub const DEVICE_PATH_LEN: usize = 256;

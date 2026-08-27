@@ -7,6 +7,7 @@ publish.workspace = true
 [dependencies]
 interdriver-driver-core = { path = "../../crates/driver-core" }
 interdriver-usbip-session = { path = "../../crates/usbip-session" }
+interdriver-control-plane = { path = "../../crates/control-plane" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 interdriver-platform-linux = { path = "../../crates/platform-linux" }
