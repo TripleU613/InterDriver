@@ -61,6 +61,7 @@ dependencies = [
  "interdriver-driver-core",
  "interdriver-platform-linux",
  "interdriver-platform-macos",
+ "interdriver-usbip-session",
 ]
 
 [[package]]

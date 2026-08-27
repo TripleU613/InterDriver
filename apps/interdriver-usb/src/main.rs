@@ -1,6 +1,11 @@
 use interdriver_driver_core::PLATFORM_ADAPTERS;
+use interdriver_usbip_session::{Session, TransferRequest};
 use std::env;
 use std::process::ExitCode;
+use std::time::Duration;
+
+const DEFAULT_PORT: u16 = 3240;
+const DEVICE_DESCRIPTOR_LEN: usize = 18;
 
 fn main() -> ExitCode {
     match run(env::args().skip(1).collect()) {
@@ -46,6 +51,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
         [platform, command, remote, bus_id] if platform == "macos" && command == "attach" => {
             macos_attach(remote, bus_id)
         }
+        [command, remote, bus_id] if command == "probe" => probe(remote, bus_id),
         [] => {
             print_help();
             Ok(())
@@ -80,6 +86,45 @@ fn print_help() {
     println!("  interdriver-usb linux attach <host> <bus-id>");
     println!("  interdriver-usb linux detach <port>");
     println!("  interdriver-usb macos attach <host> <bus-id>");
+    println!("  interdriver-usb probe <host> <bus-id>");
+}
+
+fn probe(remote: &str, bus_id: &str) -> Result<(), String> {
+    let session = Session::connect((remote, DEFAULT_PORT), bus_id, Duration::from_secs(10))
+        .map_err(|error| error.to_string())?;
+    let mut request = TransferRequest::input(0, DEVICE_DESCRIPTOR_LEN);
+    request.setup = [0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 0x12, 0x00];
+    let completion = session
+        .submit(request)
+        .map_err(|error| error.to_string())?
+        .wait_timeout(Duration::from_secs(10))
+        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())?;
+    if completion.status != 0 {
+        return Err(format!("device returned USB status {}", completion.status));
+    }
+    let bytes = completion.data;
+    if bytes.len() < DEVICE_DESCRIPTOR_LEN || bytes[1] != 0x01 {
+        return Err(format!(
+            "expected an 18-byte device descriptor, received {} bytes: {bytes:02x?}",
+            bytes.len()
+        ));
+    }
+    println!("descriptor\t{} bytes", bytes.len());
+    println!(
+        "usb\t{:x}.{:02x}",
+        bytes[3],
+        bytes[2]
+    );
+    println!("class\t{}/{}/{}", bytes[4], bytes[5], bytes[6]);
+    println!("max-packet-size\t{}", bytes[7]);
+    println!(
+        "id\t{:04x}:{:04x}",
+        u16::from_le_bytes([bytes[8], bytes[9]]),
+        u16::from_le_bytes([bytes[10], bytes[11]])
+    );
+    println!("configurations\t{}", bytes[17]);
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
