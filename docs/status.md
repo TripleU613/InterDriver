@@ -14,6 +14,7 @@ Updated 2026-08-27. Every claim below was produced by running the code, not by r
 | Rust server exports from usbfs, kernel vhci imports | Full enumeration |
 | Kernel fetched string descriptors through the Rust server | `Apple Inc.` / `iPhone` |
 | Apple `ipheth` driver bound to the tunnelled iPhone | Network interface created |
+| Windows exporter runs natively on `win-test` (Win11 22H2) | `windows list` executes, exit 0 |
 
 The data plane is real. `interdriver-usb probe <host> <bus-id>` imports a remote
 device through the Rust client/session and prints its USB device descriptor. It
@@ -55,12 +56,22 @@ it is the critical path, not more code. Do not disable SIP on the release Mac.
   removed so the importer compiles. Nothing referenced them.
 - Windows importer. Presenting a virtual device to iTunes on Windows needs a
   UDE/UDECX kernel driver with signing. Not started.
-- Windows exporter is written (`platform-windows`, WinUSB) and cross-compiles,
-  but is unrun. Open risk: WinUSB binds one interface, and an iPhone is
-  composite with three. If `interdriver-usb windows list` reports one interface for
-  the iPhone, the exporter needs one WinUSB handle per `MI_xx` interface
-  instead of walking associated interfaces from a single handle. The shipped
-  InterDriver INF binds only `MI_01`, so this is likely. Test before trusting.
+- Windows exporter (`platform-windows`, WinUSB) cross-compiles and the exe runs
+  on `win-test`. The composite-interface question is settled by design: the shipped
+  InterDriver INF (`interdriver-winusb.inf`) binds only `MI_01`, the lockdown/usbmux
+  interface that carries all pairing and enrollment traffic, so single-interface
+  WinUSB export is intended, not a workaround. Transfers against a WinUSB-bound
+  device are still unrun; that needs the iPhone's `MI_01` temporarily rebound
+  from Apple's `oem57.inf` to WinUSB, then a Windows->Linux vhci import.
+
+## Windows Transfer Layer Caveats (unrun)
+
+- `finish()` maps a failed WinUSB call as `-(Win32 error)`. Win32 codes are not
+  errno, so a non-zero USB/IP status reaching a client is nonzero-but-arbitrary.
+  Harmless on the happy path; revisit if error semantics ever matter.
+- `speed_code()` returns 0 (unknown) on Windows; WinUSB does not expose link
+  speed. The Linux importer enumerated fine with a real speed; watch the first
+  Windows attach for an unknown-speed enumeration issue.
 - `usbip-server`'s `DeviceProvider`/`DeviceSession` have test mocks only, so the
   Rust server is in no data path. `platform-linux::serve` shells out to the
   system `usbipd` binary instead.
