@@ -13,9 +13,22 @@ Type: iPhone10,1  ECID: 0xC60CC183B883A
 UDID: 4a6fbe059b44f8f206f8ca96b9319078cf2c36a9  Location: 0x2100000  Name: iPhone
 ```
 
-`cfgutil pair` reaches the device but stops at "user has not yet responded to
-the pairing request" — needs a physical Trust tap + passcode. Pairing and
-`get all` (acceptance tests 2-4) are unverified pending that tap.
+`cfgutil pair` + Trust tap succeeded. Full profile (acceptance tests 2-4 baseline
+— PASS on real hardware):
+
+```
+deviceType        iPhone10,1
+ECID              0xC60CC183B883A
+UDID              4a6fbe059b44f8f206f8ca96b9319078cf2c36a9
+serialNumber      C8PW16YHJC6D
+isSupervised      yes
+isPaired          yes
+activationState   Activated
+buildVersion      20H392  (iOS firmwareVersion 16.7.16)
+```
+
+cfgutil can pair, supervise, and query the device end to end. This is the full
+behavior the remote/virtual device must reproduce once the entitlement lands.
 
 ## IORegistry device shape (IOUSBHostDevice)
 
