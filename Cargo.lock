@@ -36,6 +36,15 @@ name = "interdriver-driver-core"
 version = "0.1.0"
 
 [[package]]
+name = "interdriver-gadget-linux"
+version = "0.1.0"
+dependencies = [
+ "interdriver-usbip-protocol",
+ "interdriver-usbip-session",
+ "libc",
+]
+
+[[package]]
 name = "interdriver-platform-linux"
 version = "0.1.0"
 dependencies = [
