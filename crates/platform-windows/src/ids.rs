@@ -27,22 +27,18 @@ fn field_after(text: &str, marker: &str) -> Option<u16> {
     u16::from_str_radix(&digits, 16).ok()
 }
 
-/// Location information looks like `Port_#0002.Hub_#0003`, which maps onto the
-/// hub and port pair that USB/IP bus IDs express as `3-2`.
+/// Interface number from a hardware id or device-interface path segment such as
+/// `...&mi_01#...`, i.e. the `MI_xx` suffix.
 #[must_use]
-pub fn parse_location(location: &str) -> Option<(u32, u32)> {
-    let port = number_after(location, "Port_#")?;
-    let hub = number_after(location, "Hub_#")?;
-    Some((hub, port))
-}
-
-fn number_after(text: &str, marker: &str) -> Option<u32> {
-    let start = text.find(marker)? + marker.len();
-    let digits: String = text[start..]
+pub fn parse_interface_number(text: &str) -> Option<u8> {
+    let upper = text.to_ascii_uppercase();
+    let start = upper.find("MI_")? + "MI_".len();
+    let digits: String = upper[start..]
         .chars()
-        .take_while(char::is_ascii_digit)
+        .take_while(|c| c.is_ascii_hexdigit())
+        .take(2)
         .collect();
-    digits.parse().ok()
+    u8::from_str_radix(&digits, 16).ok()
 }
 
 #[cfg(test)]
@@ -60,10 +56,12 @@ mod tests {
     }
 
     #[test]
-    fn maps_windows_location_onto_a_hub_port_pair() {
-        assert_eq!(parse_location("Port_#0002.Hub_#0003"), Some((3, 2)));
-        assert_eq!(parse_location("Port_#0011.Hub_#0001"), Some((1, 11)));
-        assert_eq!(parse_location("nonsense"), None);
+    fn reads_interface_number_from_a_path_segment() {
+        assert_eq!(
+            parse_interface_number(r"\\?\usb#vid_05ac&pid_12a8&mi_01#8&x#{g}"),
+            Some(1)
+        );
+        assert_eq!(parse_interface_number("USB\\VID_05AC&PID_12A8"), None);
     }
 
     #[test]

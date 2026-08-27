@@ -63,8 +63,12 @@ impl DeviceProvider for WinUsbProvider {
             if !self.permits(&found.bus_id) {
                 continue;
             }
-            let Ok(device) = OpenDevice::open(&found.path) else {
-                continue;
+            let device = match OpenDevice::open(&found.path) {
+                Ok(device) => device,
+                Err(error) => {
+                    eprintln!("skip {}: {error}", found.bus_id);
+                    continue;
+                }
             };
             let descriptor = device.device_descriptor().unwrap_or([0; DEVICE_DESCRIPTOR_LEN]);
             let interfaces = device.interface_records();
@@ -72,9 +76,9 @@ impl DeviceProvider for WinUsbProvider {
             let mut record = DeviceRecord::new(
                 &found.path,
                 &found.bus_id,
-                found.hub,
-                found.port,
-                speed_code(&device),
+                0,
+                u32::from(found.interface_number),
+                0,
                 found.vendor_id,
                 found.product_id,
             )
@@ -142,14 +146,20 @@ impl OpenDevice {
             )
         };
         if file == INVALID_HANDLE_VALUE {
-            return Err(io::Error::last_os_error());
+            return Err(io::Error::new(
+                io::Error::last_os_error().kind(),
+                format!("CreateFileW({path}): {}", io::Error::last_os_error()),
+            ));
         }
 
         let mut primary: WINUSB_INTERFACE_HANDLE = std::ptr::null_mut();
         if unsafe { WinUsb_Initialize(file, &mut primary) } == 0 {
             let error = io::Error::last_os_error();
             unsafe { CloseHandle(file) };
-            return Err(error);
+            return Err(io::Error::new(
+                error.kind(),
+                format!("WinUsb_Initialize: {error}"),
+            ));
         }
 
         let mut interfaces = vec![primary];
@@ -320,11 +330,6 @@ fn query_interface(handle: WINUSB_INTERFACE_HANDLE) -> Option<USB_INTERFACE_DESC
     let mut descriptor: USB_INTERFACE_DESCRIPTOR = unsafe { std::mem::zeroed() };
     let ok = unsafe { WinUsb_QueryInterfaceSettings(handle, 0, &mut descriptor) };
     (ok != 0).then_some(descriptor)
-}
-
-/// WinUSB does not report link speed, and USB/IP treats an unknown speed as 0.
-fn speed_code(_device: &OpenDevice) -> u32 {
-    0
 }
 
 fn finish(

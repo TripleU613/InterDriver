@@ -1,21 +1,31 @@
-use crate::ids::{parse_hardware_id, parse_location, wide_string_at};
+use crate::ids::{parse_hardware_id, parse_interface_number};
 use std::io;
 use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
-    DIGCF_DEVICEINTERFACE, DIGCF_PRESENT, HDEVINFO, SP_DEVICE_INTERFACE_DATA, SP_DEVINFO_DATA,
-    SPDRP_HARDWAREID, SPDRP_LOCATION_INFORMATION, SetupDiDestroyDeviceInfoList,
-    SetupDiEnumDeviceInterfaces, SetupDiGetClassDevsW, SetupDiGetDeviceInterfaceDetailW,
-    SetupDiGetDeviceRegistryPropertyW,
+    DIGCF_DEVICEINTERFACE, DIGCF_PRESENT, HDEVINFO, SP_DEVICE_INTERFACE_DATA,
+    SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInterfaces, SetupDiGetClassDevsW,
+    SetupDiGetDeviceInterfaceDetailW,
 };
-use windows_sys::Win32::Devices::Usb::GUID_DEVINTERFACE_USB_DEVICE;
+use windows_sys::core::GUID;
 
-/// One physically attached USB device, as SetupAPI reports it.
+/// The device-interface class Windows registers for every WinUSB-bound
+/// function, including the interface an iPhone exposes once `MI_01` is on
+/// WinUSB. `GUID_DEVINTERFACE_USB_DEVICE` only returns composite parents, which
+/// are owned by usbccgp and cannot be opened with WinUSB.
+const GUID_DEVINTERFACE_WINUSB: GUID = GUID {
+    data1: 0xdee824ef,
+    data2: 0x729b,
+    data3: 0x4a0e,
+    data4: [0x9c, 0x14, 0xb7, 0x11, 0x7d, 0x33, 0xa8, 0x17],
+};
+
+/// One WinUSB-accessible interface, addressed by the device-interface path that
+/// `CreateFileW` opens.
 pub struct FoundDevice {
     pub bus_id: String,
     pub path: String,
     pub vendor_id: u16,
     pub product_id: u16,
-    pub hub: u32,
-    pub port: u32,
+    pub interface_number: u8,
 }
 
 struct DeviceInfoList(HDEVINFO);
@@ -29,7 +39,7 @@ impl Drop for DeviceInfoList {
 pub fn list_devices() -> io::Result<Vec<FoundDevice>> {
     let handle = unsafe {
         SetupDiGetClassDevsW(
-            &GUID_DEVINTERFACE_USB_DEVICE,
+            &GUID_DEVINTERFACE_WINUSB,
             std::ptr::null(),
             std::ptr::null_mut(),
             DIGCF_PRESENT | DIGCF_DEVICEINTERFACE,
@@ -45,7 +55,7 @@ pub fn list_devices() -> io::Result<Vec<FoundDevice>> {
     loop {
         let mut interface = SP_DEVICE_INTERFACE_DATA {
             cbSize: size_of::<SP_DEVICE_INTERFACE_DATA>() as u32,
-            InterfaceClassGuid: GUID_DEVINTERFACE_USB_DEVICE,
+            InterfaceClassGuid: GUID_DEVINTERFACE_WINUSB,
             Flags: 0,
             Reserved: 0,
         };
@@ -53,7 +63,7 @@ pub fn list_devices() -> io::Result<Vec<FoundDevice>> {
             SetupDiEnumDeviceInterfaces(
                 list.0,
                 std::ptr::null(),
-                &GUID_DEVINTERFACE_USB_DEVICE,
+                &GUID_DEVINTERFACE_WINUSB,
                 index,
                 &mut interface,
             )
@@ -63,42 +73,28 @@ pub fn list_devices() -> io::Result<Vec<FoundDevice>> {
         }
         index += 1;
 
-        let mut info = SP_DEVINFO_DATA {
-            cbSize: size_of::<SP_DEVINFO_DATA>() as u32,
-            ClassGuid: GUID_DEVINTERFACE_USB_DEVICE,
-            DevInst: 0,
-            Reserved: 0,
-        };
-        let Some(path) = interface_path(list.0, &mut interface, &mut info)? else {
+        let Some(path) = interface_path(list.0, &mut interface)? else {
             continue;
         };
-        let Some(hardware_id) = registry_string(list.0, &mut info, SPDRP_HARDWAREID) else {
+        let Some((vendor_id, product_id)) = parse_hardware_id(&path) else {
             continue;
         };
-        let Some((vendor_id, product_id)) = parse_hardware_id(&hardware_id) else {
-            continue;
-        };
-        let location = registry_string(list.0, &mut info, SPDRP_LOCATION_INFORMATION)
-            .unwrap_or_default();
-        let (hub, port) = parse_location(&location).unwrap_or((0, index));
-
+        let interface_number = parse_interface_number(&path).unwrap_or(0);
         devices.push(FoundDevice {
-            bus_id: format!("{hub}-{port}"),
+            bus_id: bus_id_from_path(&path),
             path,
             vendor_id,
             product_id,
-            hub,
-            port,
+            interface_number,
         });
     }
-    devices.sort_by(|left, right| (left.hub, left.port).cmp(&(right.hub, right.port)));
+    devices.sort_by(|left, right| left.bus_id.cmp(&right.bus_id));
     Ok(devices)
 }
 
 fn interface_path(
     list: HDEVINFO,
     interface: *mut SP_DEVICE_INTERFACE_DATA,
-    info: *mut SP_DEVINFO_DATA,
 ) -> io::Result<Option<String>> {
     let mut required = 0_u32;
     unsafe {
@@ -115,17 +111,12 @@ fn interface_path(
         return Ok(None);
     }
 
-    // SP_DEVICE_INTERFACE_DETAIL_DATA_W is a variable-length struct: a u32
-    // cbSize followed by the path. The buffer is over-aligned to u32 so the
-    // leading cbSize write is aligned, and cbSize itself must describe the
-    // fixed header only, not the allocation.
+    // SP_DEVICE_INTERFACE_DETAIL_DATA_W is a u32 cbSize followed by the path.
+    // The buffer is a u32 slice so the leading cbSize write is aligned; cbSize
+    // itself describes only the fixed header (8 on 64-bit, 6 on 32-bit).
     let words = (required as usize).div_ceil(size_of::<u32>()) + 1;
     let mut buffer = vec![0_u32; words];
-    buffer[0] = if cfg!(target_pointer_width = "64") {
-        8
-    } else {
-        6
-    };
+    buffer[0] = if cfg!(target_pointer_width = "64") { 8 } else { 6 };
     let ok = unsafe {
         SetupDiGetDeviceInterfaceDetailW(
             list,
@@ -133,7 +124,7 @@ fn interface_path(
             buffer.as_mut_ptr().cast(),
             required,
             std::ptr::null_mut(),
-            info,
+            std::ptr::null_mut(),
         )
     };
     if ok == 0 {
@@ -142,44 +133,33 @@ fn interface_path(
     let bytes: &[u8] = unsafe {
         std::slice::from_raw_parts(buffer.as_ptr().cast::<u8>(), buffer.len() * size_of::<u32>())
     };
-    Ok(Some(wide_string_at(&bytes[size_of::<u32>()..])))
+    Ok(Some(crate::ids::wide_string_at(&bytes[size_of::<u32>()..])))
 }
 
-fn registry_string(
-    list: HDEVINFO,
-    info: *mut SP_DEVINFO_DATA,
-    property: u32,
-) -> Option<String> {
-    let mut required = 0_u32;
-    unsafe {
-        SetupDiGetDeviceRegistryPropertyW(
-            list,
-            info,
-            property,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            0,
-            &mut required,
-        )
-    };
-    if required == 0 {
-        return None;
-    }
-    let mut buffer = vec![0_u8; required as usize + 2];
-    let ok = unsafe {
-        SetupDiGetDeviceRegistryPropertyW(
-            list,
-            info,
-            property,
-            std::ptr::null_mut(),
-            buffer.as_mut_ptr(),
-            required,
-            std::ptr::null_mut(),
-        )
-    };
-    if ok == 0 {
-        return None;
-    }
-    Some(wide_string_at(&buffer))
+/// Windows has no USB/IP bus IDs, so the device-interface path's instance
+/// segment is sanitised into a stable identifier that `open` can match back to
+/// the same path. Example path segment `8&10379175&1&0001` becomes
+/// `8_10379175_1_0001`.
+fn bus_id_from_path(path: &str) -> String {
+    let instance = path
+        .split('#')
+        .nth(2)
+        .or_else(|| path.split('#').nth(1))
+        .unwrap_or(path);
+    let sanitized: String = instance
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    sanitized.chars().take(31).collect()
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn derives_a_stable_bus_id_from_an_interface_path() {
+        let path = r"\\?\usb#vid_05ac&pid_12a8&mi_01#8&10379175&1&0001#{dee824ef-729b-4a0e-9c14-b7117d33a817}";
+        assert_eq!(bus_id_from_path(path), "8_10379175_1_0001");
+    }
+}

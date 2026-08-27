@@ -56,8 +56,19 @@ it is the critical path, not more code. Do not disable SIP on the release Mac.
   removed so the importer compiles. Nothing referenced them.
 - Windows importer. Presenting a virtual device to iTunes on Windows needs a
   UDE/UDECX kernel driver with signing. Not started.
-- Windows exporter (`platform-windows`, WinUSB) cross-compiles and the exe runs
-  on `win-test`. The composite-interface question is settled by design: the shipped
+- Windows exporter (`platform-windows`, WinUSB): the exe runs on `win-test`,
+  enumeration now finds the WinUSB `MI_01` interface (fixed: enumerate the
+  standard WinUSB device-interface GUID `{DEE824EF-...}`, not
+  `GUID_DEVINTERFACE_USB_DEVICE`, which returns only usbccgp composite parents).
+  Remaining blocker: `CreateFileW` on the interface path returns ERROR_NOT_
+  SUPPORTED (50) for every access/flag combination, though the device is healthy
+  (problem code 0) and on `service = WINUSB`. A device disable/enable cycle did
+  not clear it. This is the documented aftermath of a *forced*
+  `UpdateDriverForPlugAndPlayDevices` WinUSB swap: the interface needs a full
+  reboot before its device object accepts opens. Untested past this point;
+  reboot `win-test` and re-run `interdriver-usb windows list`.
+
+  The composite-interface question is settled by design: the shipped
   InterDriver INF (`interdriver-winusb.inf`) binds only `MI_01`, the lockdown/usbmux
   interface that carries all pairing and enrollment traffic, so single-interface
   WinUSB export is intended, not a workaround. Transfers against a WinUSB-bound
