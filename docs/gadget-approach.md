@@ -95,10 +95,31 @@ status stage) and `ep0_write` reports EBUSY there; and `USB_RAW_IOCTL_CONFIGURE`
 must run before that completion. Kernel bitfield order also puts `dir_in` at
 bit 4, which the endpoint probe caught.
 
+### Bulk data is byte-correct (acceptance test 3)
+
+Endpoint mirroring and bulk transfer were then proven without any hardware and
+without the iPhone, by manufacturing a bulk device locally. `dummy_hcd num=2`
+gives two controllers: `g_mass_storage` (backed by a FAT image holding a known
+270,177-byte payload) binds the first, and the bridge presents it on the second.
+
+```
+configuration 1: 32 bytes, 2 endpoint(s) at altsetting 0
+endpoint 0x81 (in)  enabled as handle 0, maxpacket 512
+endpoint 0x02 (out) enabled as handle 1, maxpacket 512
+6-1:1.0 -> usb-storage        (the tunnelled clone; source 5-1 is on usbfs)
+sha256 expected c522d3a145723874dd48fdb897b7e9eba700995569ec08971997c902263d27c2
+sha256 got      c522d3a145723874dd48fdb897b7e9eba700995569ec08971997c902263d27c2
+```
+
+The full chain — gadget -> usb-storage -> usbfs exporter -> USB/IP over TCP ->
+raw-gadget bridge -> second UDC -> host usb-storage -> filesystem -> file read —
+returns the payload byte for byte. Bulk IN and OUT both work.
+
 Remaining: class requests `bmRequestType=0x21 bRequest=0x04` (UVC/audio SET_CUR)
-are stalled by the source device, so streaming video is not expected to work
-yet. Enumeration and driver binding — what Configurator needs — do work. This is
-still a Linux-host proof; a Mac has not seen this device.
+are stalled by the source webcam, and isochronous endpoints are not carried, so
+streaming video is not expected to work. Neither matters for Configurator, which
+uses bulk on the usbmux interface. This is still a Linux-host proof; a Mac has
+not seen this device.
 
 ## Hardware
 
