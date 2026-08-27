@@ -61,7 +61,19 @@ dependencies = [
  "interdriver-driver-core",
  "interdriver-platform-linux",
  "interdriver-platform-macos",
+ "interdriver-usbfs-linux",
+ "interdriver-usbip-server",
  "interdriver-usbip-session",
+ "signal-hook",
+]
+
+[[package]]
+name = "interdriver-usbfs-linux"
+version = "0.1.0"
+dependencies = [
+ "interdriver-usbip-protocol",
+ "interdriver-usbip-server",
+ "libc",
 ]
 
 [[package]]

@@ -8,6 +8,7 @@ members = [
     "crates/usbip-protocol",
     "crates/usbip-server",
     "crates/usbip-session",
+    "crates/usbfs-linux",
 ]
 resolver = "3"
 

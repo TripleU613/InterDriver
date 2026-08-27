@@ -11,6 +11,9 @@ Updated 2026-08-27. Every claim below was produced by running the code, not by r
 | Rust import + URB submit against the kernel | Real descriptor returned |
 | Real iPhone `05ac:12a8` exported from Linux | 4 configurations reported |
 | MacBook reads that iPhone over Tailscale | Same descriptor, `exit=0` |
+| Rust server exports from usbfs, kernel vhci imports | Full enumeration |
+| Kernel fetched string descriptors through the Rust server | `Apple Inc.` / `iPhone` |
+| Apple `ipheth` driver bound to the tunnelled iPhone | Network interface created |
 
 The data plane is real. `interdriver-usb probe <host> <bus-id>` imports a remote
 device through the Rust client/session and prints its USB device descriptor. It
@@ -29,6 +32,19 @@ required entitlement: com.apple.developer.usb.host-controller-interface
 The FFI is correct and reaches Apple's framework. Nothing in the Rust importer
 can be verified further until Apple grants the managed entitlement. Requesting
 it is the critical path, not more code. Do not disable SIP on the release Mac.
+
+## Known Limits of the usbfs Exporter
+
+- Isochronous endpoints are unsupported. usbfs synchronous ioctls cover control,
+  bulk, and interrupt only, so a tunnelled webcam enumerates but cannot stream.
+  Isochronous needs the asynchronous `USBDEVFS_SUBMITURB`/`REAPURB` API.
+- A submitted transfer occupies a thread until it completes or the 30 second
+  timeout expires, and `cancel` cannot interrupt it. `ipheth` reading an idle
+  iPhone therefore reports `-110`, which is correct but wasteful.
+- usbmuxd segfaults when exporter and importer are the same host, because it
+  sees the physical and the virtual iPhone with one identical UDID. This is a
+  test artefact, not a product path. Proving Apple tooling end to end needs a
+  second machine with `usbip` and `vhci_hcd`.
 
 ## Not Yet Written
 

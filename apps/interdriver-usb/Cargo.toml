@@ -10,6 +10,9 @@ interdriver-usbip-session = { path = "../../crates/usbip-session" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 interdriver-platform-linux = { path = "../../crates/platform-linux" }
+interdriver-usbfs-linux = { path = "../../crates/usbfs-linux" }
+interdriver-usbip-server = { path = "../../crates/usbip-server" }
+signal-hook = "0.3.18"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 interdriver-platform-macos = { path = "../../crates/platform-macos" }

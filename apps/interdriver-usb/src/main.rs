@@ -52,6 +52,15 @@ fn run(args: Vec<String>) -> Result<(), String> {
             macos_attach(remote, bus_id)
         }
         [command, remote, bus_id] if command == "probe" => probe(remote, bus_id),
+        [platform, command, bus_id] if platform == "linux" && command == "export" => {
+            linux_export(bus_id, DEFAULT_PORT)
+        }
+        [platform, command, bus_id, port] if platform == "linux" && command == "export" => {
+            let port = port
+                .parse::<u16>()
+                .map_err(|_| "port must be an integer from 1 to 65535".to_string())?;
+            linux_export(bus_id, port)
+        }
         [] => {
             print_help();
             Ok(())
@@ -86,6 +95,7 @@ fn print_help() {
     println!("  interdriver-usb linux attach <host> <bus-id>");
     println!("  interdriver-usb linux detach <port>");
     println!("  interdriver-usb macos attach <host> <bus-id>");
+    println!("  interdriver-usb linux export <bus-id> [port]");
     println!("  interdriver-usb probe <host> <bus-id>");
 }
 
@@ -125,6 +135,45 @@ fn probe(remote: &str, bus_id: &str) -> Result<(), String> {
     );
     println!("configurations\t{}", bytes[17]);
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_export(bus_id: &str, port: u16) -> Result<(), String> {
+    use std::net::TcpListener;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    let provider = Arc::new(interdriver_usbfs_linux::UsbfsProvider::for_device(bus_id));
+    let listener =
+        TcpListener::bind(("0.0.0.0", port)).map_err(|error| format!("bind {port}: {error}"))?;
+    let shutdown = Arc::new(AtomicBool::new(false));
+    signal_flag(&shutdown)?;
+    eprintln!("exporting {bus_id} from usbfs on port {port}; press Ctrl-C to stop");
+    interdriver_usbip_server::serve(listener, provider, shutdown).map_err(|error| error.to_string())
+}
+
+#[cfg(target_os = "linux")]
+fn signal_flag(flag: &std::sync::Arc<std::sync::atomic::AtomicBool>) -> Result<(), String> {
+    for signal in [libc_sigint(), libc_sigterm()] {
+        signal_hook::flag::register(signal, std::sync::Arc::clone(flag))
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+const fn libc_sigint() -> i32 {
+    signal_hook::consts::SIGINT
+}
+
+#[cfg(target_os = "linux")]
+const fn libc_sigterm() -> i32 {
+    signal_hook::consts::SIGTERM
+}
+
+#[cfg(not(target_os = "linux"))]
+fn linux_export(_bus_id: &str, _port: u16) -> Result<(), String> {
+    Err("Linux adapter is unavailable on this platform".into())
 }
 
 #[cfg(target_os = "linux")]
