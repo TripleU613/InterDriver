@@ -66,6 +66,40 @@ in this kernel.
 enumerates the result. It does NOT prove a Mac accepts it** — the Mac never sees
 `dummy_hcd`. That claim needs a real board on a real cable.
 
+## Status — bridge works (proven on dummy_hcd)
+
+`interdriver-usb linux gadget <host> <bus-id> [udc-driver udc-device]` imports a
+device over USB/IP and presents it on a UDC through raw-gadget. It synthesises
+nothing: every endpoint-0 control request is forwarded verbatim to the real
+device and the device's own reply is returned.
+
+Proven with the webcam exported from usbfs on the same host and presented on
+`dummy_udc.0`:
+
+```
+usb 7-1: new high-speed USB device number 5 using dummy_hcd
+usb 7-1: New USB device found, idVendor=0c45, idProduct=6340
+usb 7-1: Product: SD webcam 5160
+bConfigurationValue=1  bNumInterfaces=4
+7-1:1.0 -> uvcvideo   7-1:1.1 -> uvcvideo
+7-1:1.2 -> snd-usb-audio  7-1:1.3 -> snd-usb-audio
+/dev/video0, /dev/video1  ->  owned by 7-1 (the tunnelled clone)
+```
+
+The host enumerated it, configured it, bound real class drivers, and created
+V4L2 device nodes — from a device reached only over TCP.
+
+Two bugs found and fixed by doing it: raw-gadget completes a host-to-device
+control request with `ep0_read` (even at zero length, where the read is only the
+status stage) and `ep0_write` reports EBUSY there; and `USB_RAW_IOCTL_CONFIGURE`
+must run before that completion. Kernel bitfield order also puts `dir_in` at
+bit 4, which the endpoint probe caught.
+
+Remaining: class requests `bmRequestType=0x21 bRequest=0x04` (UVC/audio SET_CUR)
+are stalled by the source device, so streaming video is not expected to work
+yet. Enumeration and driver binding — what Configurator needs — do work. This is
+still a Linux-host proof; a Mac has not seen this device.
+
 ## Hardware
 
 No board on the tailnet has a UDC (all x86_64 hosts). A real test needs an SBC

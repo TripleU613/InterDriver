@@ -82,10 +82,12 @@ version = "0.1.0"
 dependencies = [
  "interdriver-control-plane",
  "interdriver-driver-core",
+ "interdriver-gadget-linux",
  "interdriver-platform-linux",
  "interdriver-platform-macos",
  "interdriver-platform-windows",
  "interdriver-usbfs-linux",
+ "interdriver-usbip-client",
  "interdriver-usbip-server",
  "interdriver-usbip-session",
  "signal-hook",

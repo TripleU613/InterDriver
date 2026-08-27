@@ -55,6 +55,10 @@ const USB_RAW_IOCTL_EPS_INFO: u64 = ior(11, (EPS_NUM * 32) as u64);
 pub const USB_RAW_EVENT_INVALID: u32 = 0;
 pub const USB_RAW_EVENT_CONNECT: u32 = 1;
 pub const USB_RAW_EVENT_CONTROL: u32 = 2;
+pub const USB_RAW_EVENT_SUSPEND: u32 = 3;
+pub const USB_RAW_EVENT_RESUME: u32 = 4;
+pub const USB_RAW_EVENT_RESET: u32 = 5;
+pub const USB_RAW_EVENT_DISCONNECT: u32 = 6;
 
 pub const USB_SPEED_FULL: u8 = 2;
 pub const USB_SPEED_HIGH: u8 = 3;
@@ -223,7 +227,7 @@ pub fn event_fetch(fd: BorrowedFd<'_>) -> io::Result<Event> {
     })
 }
 
-fn transfer(fd: BorrowedFd<'_>, request: u64, ep: u16, data: &mut Vec<u8>) -> io::Result<usize> {
+fn transfer(fd: BorrowedFd<'_>, request: u64, ep: u16, data: &mut [u8]) -> io::Result<usize> {
     // usb_raw_ep_io is a header immediately followed by the payload, so the
     // header and data must live in one allocation.
     let mut buffer = vec![0_u8; 8 + data.len()];
@@ -237,7 +241,7 @@ fn transfer(fd: BorrowedFd<'_>, request: u64, ep: u16, data: &mut Vec<u8>) -> io
     Ok(transferred)
 }
 
-pub fn ep0_read(fd: BorrowedFd<'_>, data: &mut Vec<u8>) -> io::Result<usize> {
+pub fn ep0_read(fd: BorrowedFd<'_>, data: &mut [u8]) -> io::Result<usize> {
     transfer(fd, USB_RAW_IOCTL_EP0_READ, 0, data)
 }
 
@@ -246,7 +250,7 @@ pub fn ep0_write(fd: BorrowedFd<'_>, data: &[u8]) -> io::Result<usize> {
     transfer(fd, USB_RAW_IOCTL_EP0_WRITE, 0, &mut owned)
 }
 
-pub fn ep_read(fd: BorrowedFd<'_>, handle: u16, data: &mut Vec<u8>) -> io::Result<usize> {
+pub fn ep_read(fd: BorrowedFd<'_>, handle: u16, data: &mut [u8]) -> io::Result<usize> {
     transfer(fd, USB_RAW_IOCTL_EP_READ, handle, data)
 }
 

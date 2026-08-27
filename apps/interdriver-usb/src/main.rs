@@ -65,6 +65,14 @@ fn run(mut args: Vec<String>) -> Result<(), String> {
             macos_attach(remote, bus_id)
         }
         [command, remote, bus_id] if command == "probe" => probe(remote, bus_id, ticket),
+        [platform, command, remote, bus_id] if platform == "linux" && command == "gadget" => {
+            linux_gadget(remote, bus_id, ticket, "dummy_udc", "dummy_udc.0")
+        }
+        [platform, command, remote, bus_id, driver, device]
+            if platform == "linux" && command == "gadget" =>
+        {
+            linux_gadget(remote, bus_id, ticket, driver, device)
+        }
         [platform, command, bus_id] if platform == "linux" && command == "export" => {
             linux_export(bus_id, DEFAULT_PORT, ticket, broker_addr, exporter_id)
         }
@@ -127,6 +135,7 @@ fn print_help() {
     println!("  interdriver-usb macos attach <host> <bus-id>");
     println!("  interdriver-usb linux export <bus-id> [port] [--ticket <hex>]");
     println!("  interdriver-usb probe <host> <bus-id> [--ticket <hex>]");
+    println!("  interdriver-usb linux gadget <host> <bus-id> [udc-driver udc-device]");
     println!("  interdriver-usb broker <port>");
     println!("  interdriver-usb issue <broker-addr> <device> <exporter> <importer> [ttl]");
     println!("  interdriver-usb linux export <bus-id> [port] --broker <addr> --exporter <id>");
@@ -223,6 +232,40 @@ fn probe(remote: &str, bus_id: &str, ticket: Option<[u8; 32]>) -> Result<(), Str
     );
     println!("configurations\t{}", bytes[17]);
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_gadget(
+    remote: &str,
+    bus_id: &str,
+    ticket: Option<[u8; 32]>,
+    udc_driver: &str,
+    udc_device: &str,
+) -> Result<(), String> {
+    let imported = interdriver_usbip_client::import_with_ticket(
+        (remote, DEFAULT_PORT),
+        bus_id,
+        Duration::from_secs(10),
+        ticket,
+    )
+    .map_err(|error| error.to_string())?;
+    let speed = imported.device.speed;
+    let session = Session::from_imported(imported).map_err(|error| error.to_string())?;
+    eprintln!("presenting {bus_id} on {udc_driver}/{udc_device}; Ctrl-C to stop");
+    let mut bridge = interdriver_gadget_linux::bridge::Bridge::new(udc_driver, udc_device, session, speed)
+        .map_err(|error| error.to_string())?;
+    bridge.run().map_err(|error| error.to_string())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn linux_gadget(
+    _remote: &str,
+    _bus_id: &str,
+    _ticket: Option<[u8; 32]>,
+    _udc_driver: &str,
+    _udc_device: &str,
+) -> Result<(), String> {
+    Err("raw-gadget is only available on Linux".into())
 }
 
 #[cfg(target_os = "linux")]
