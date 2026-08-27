@@ -8,6 +8,10 @@ publish.workspace = true
 name = "interdriver-macos-controller-probe"
 path = "src/bin/controller_probe.rs"
 
+[[bin]]
+name = "interdriver-macos-export-probe"
+path = "src/bin/export_probe.rs"
+
 [target.'cfg(target_os = "macos")'.dependencies]
 block2 = "0.6.2"
 interdriver-usbip-client = { path = "../usbip-client" }

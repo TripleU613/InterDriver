@@ -102,6 +102,31 @@ Still to wire: transport (carry USB/IP inside mutually authenticated TLS/QUIC),
 and authenticating the operator to the broker (today the ISSUE verb is
 unauthenticated — do not expose the broker port off a trusted network).
 
+## macOS Export — VIABLE (probe proven on hardware)
+
+`interdriver-macos-export-probe` (in `platform-macos`) took **exclusive ownership**
+of the attached iPhone via `IOUSBHostDevice initWithIOService:queue:error:
+interestHandler:` — non-root, no entitlement error:
+
+```
+EXCLUSIVE OPEN OK: 05ac:12a8 — userspace took exclusive ownership
+```
+
+This is the opposite gate from the importer: device *capture* (export) needs no
+managed entitlement, unlike the virtual *controller* (import). So the macOS
+exporter is buildable and testable (Mac -> Linux) now; the full exporter still
+has to implement endpoint I/O (`IOUSBHostInterface`/pipes) behind the shared
+`DeviceProvider` contract, same shape as `UsbfsProvider` and `WinUsbProvider`.
+
+## Windows Import — needs a toolchain we do not have
+
+The Windows importer is a KMDF **UdeCx** virtual-controller kernel driver. It
+requires the Windows Driver Kit, a test-signing-enabled (or EV-signed) dedicated
+box, and a kernel debugger; release needs Windows HLK. None of that is available
+in this environment, so writing source here would produce code that cannot be
+compiled, signed, loaded, or tested. Left intentionally unwritten. This is the
+single largest remaining piece and is properly its own driver-signing project.
+
 ## Not Yet Written
 
 - macOS exporter. Codex declared `mod exporter` with `list_physical_devices`
