@@ -52,6 +52,9 @@ fn run(mut args: Vec<String>) -> Result<(), String> {
             linux_detach(port)
         }
         [platform, command] if platform == "windows" && command == "list" => windows_list(),
+        [platform, command, inf] if platform == "windows" && command == "install-driver" => {
+            windows_install_driver(inf)
+        }
         [platform, command, bus_id] if platform == "windows" && command == "export" => {
             windows_export(bus_id, DEFAULT_PORT)
         }
@@ -131,6 +134,7 @@ fn print_help() {
     println!("  interdriver-usb linux attach <host> <bus-id>");
     println!("  interdriver-usb linux detach <port>");
     println!("  interdriver-usb windows list");
+    println!("  interdriver-usb windows install-driver <inf-path>");
     println!("  interdriver-usb windows export <bus-id> [port]");
     println!("  interdriver-usb macos attach <host> <bus-id>");
     println!("  interdriver-usb linux export <bus-id> [port] [--ticket <hex>]");
@@ -488,6 +492,22 @@ fn windows_list() -> Result<(), String> {
 
 #[cfg(not(target_os = "windows"))]
 fn windows_list() -> Result<(), String> {
+    Err("Windows adapter is unavailable on this platform".into())
+}
+
+#[cfg(target_os = "windows")]
+fn windows_install_driver(inf: &str) -> Result<(), String> {
+    let reboot = interdriver_platform_windows::install_root_device(r"root\interdriverude", inf)
+        .map_err(|error| error.to_string())?;
+    println!("virtual controller devnode created from {inf}");
+    if reboot {
+        println!("windows requests a reboot to finish");
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn windows_install_driver(_inf: &str) -> Result<(), String> {
     Err("Windows adapter is unavailable on this platform".into())
 }
 

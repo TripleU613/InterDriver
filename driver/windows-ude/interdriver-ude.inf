@@ -1,0 +1,59 @@
+;
+; interdriver-ude.inf
+;
+; Root-enumerated virtual USB host controller built on Microsoft's UdeCx class
+; extension. The device has no physical hardware; it is created explicitly by
+; `interdriver-usb windows install-driver`.
+;
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = System
+ClassGuid   = {4d36e97d-e325-11ce-bfc1-08002be10318}
+Provider    = %ManufacturerName%
+CatalogFile = interdriver-ude.cat
+DriverVer   = 01/01/2030,1.0.0.0
+PnpLockdown = 1
+
+[DestinationDirs]
+DefaultDestDir = 13
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[SourceDisksFiles]
+interdriver-ude.sys = 1,,
+
+[Manufacturer]
+%ManufacturerName% = Standard,NTamd64
+
+[Standard.NTamd64]
+%DeviceName% = GtUde_Device, root\interdriverude
+
+[GtUde_Device.NT]
+CopyFiles = Drivers_Dir
+
+[Drivers_Dir]
+interdriver-ude.sys
+
+[GtUde_Device.NT.Services]
+AddService = interdriver_ude,0x00000002, GtUde_Service_Inst
+
+[GtUde_Service_Inst]
+DisplayName   = %ServiceName%
+ServiceType   = 1
+StartType     = 3
+ErrorControl  = 1
+ServiceBinary = %13%\interdriver-ude.sys
+
+[GtUde_Device.NT.Wdf]
+KmdfService = interdriver_ude, GtUde_wdfsect
+
+[GtUde_wdfsect]
+KmdfLibraryVersion = 1.33
+
+[Strings]
+ManufacturerName = "InterDriver"
+DiskName         = "InterDriver UDE Installation Disk"
+DeviceName       = "InterDriver Virtual USB Host Controller"
+ServiceName      = "InterDriver UDE Controller"

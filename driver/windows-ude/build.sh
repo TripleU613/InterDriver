@@ -36,7 +36,13 @@ clang-cl --target=x86_64-pc-windows-msvc \
 lld-link \
   /OUT:"$OUT/interdriver-ude.sys" \
   /DRIVER /SUBSYSTEM:NATIVE /ENTRY:FxDriverEntry /NODEFAULTLIB \
-  /MACHINE:X64 /DEBUG \
+  /MACHINE:X64 /DEBUG /MAP:"$OUT/interdriver-ude.map" \
+  /BASE:0x10000 /DYNAMICBASE /NXCOMPAT /RELEASE \
+  /ALIGN:0x1000 /FILEALIGN:0x1000 \
+  /SECTION:.text,ERP /SECTION:.rdata,RP /SECTION:.data,RWP /SECTION:.pdata,RP \
+  /MERGE:_guard_check_icall_=.rdata \
+  /MERGE:_guard_dispatch_icall_=.rdata \
+  /MERGE:memset_=.rdata \
   /LIBPATH:"$WDK/Lib/$SDKVER/km/x64" \
   /LIBPATH:"$WDK/Lib/$SDKVER/km/x64/ude/1.0" \
   /LIBPATH:"$WDK/Lib/wdf/kmdf/x64/$KMDF" \
