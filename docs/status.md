@@ -49,6 +49,25 @@ it is the critical path, not more code. Do not disable SIP on the release Mac.
   end needs a second machine with `usbip` and `vhci_hcd`, which also settles
   the cause. Until then, treat it as an open question, not a closed one.
 
+## Control Plane (new, tested on Linux)
+
+`control-plane` implements the "initiate contact" API from architecture.md,
+fully unit-tested (13 tests), no external crypto deps:
+
+- `Broker::issue` matches one exporter to one importer for one `DeviceKey` and
+  mints a 256-bit `Token` from `/dev/urandom`. Fails `DeviceBusy` if the device
+  already has a live session — one consumer per physical device.
+- `Broker::redeem` is single-use, TTL-bounded, and importer-bound; a second
+  redeem, an expired ticket, or a wrong importer are all rejected.
+- `Broker::revoke` / `release` free the device; a revoked ticket cannot be
+  reused, and the device is claimable again afterwards.
+- `Token` compares in constant time and never appears in Debug output.
+
+Time is injected as unix seconds (no ambient clock) so the logic is
+deterministic. Still to wire: transport (carry USB/IP inside mutually
+authenticated TLS/QUIC) and binding the broker into the exporter/importer CLIs
+so a session ticket actually gates a data connection.
+
 ## Not Yet Written
 
 - macOS exporter. Codex declared `mod exporter` with `list_physical_devices`

@@ -10,6 +10,7 @@ members = [
     "crates/usbip-server",
     "crates/usbip-session",
     "crates/usbfs-linux",
+    "crates/control-plane",
 ]
 resolver = "3"
 
