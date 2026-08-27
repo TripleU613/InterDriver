@@ -1,3 +1,5 @@
 /target/
 **/build/
 *.log
+/.wdk/
+/driver/windows-ude/build/
