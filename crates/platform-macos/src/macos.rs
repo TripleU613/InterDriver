@@ -13,9 +13,6 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-mod exporter;
-pub use exporter::{list_physical_devices, serve_physical};
-
 const MESSAGE_TYPE_CONTROLLER_CAPABILITIES: u32 = 0x00;
 const MESSAGE_TYPE_PORT_CAPABILITIES: u32 = 0x01;
 const MESSAGE_CONTROL_NO_RESPONSE: u32 = 1 << 14;
