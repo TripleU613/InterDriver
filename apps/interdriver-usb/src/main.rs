@@ -48,6 +48,16 @@ fn run(args: Vec<String>) -> Result<(), String> {
         [platform, command, port] if platform == "linux" && command == "detach" => {
             linux_detach(port)
         }
+        [platform, command] if platform == "windows" && command == "list" => windows_list(),
+        [platform, command, bus_id] if platform == "windows" && command == "export" => {
+            windows_export(bus_id, DEFAULT_PORT)
+        }
+        [platform, command, bus_id, port] if platform == "windows" && command == "export" => {
+            let port = port
+                .parse::<u16>()
+                .map_err(|_| "port must be an integer from 1 to 65535".to_string())?;
+            windows_export(bus_id, port)
+        }
         [platform, command, remote, bus_id] if platform == "macos" && command == "attach" => {
             macos_attach(remote, bus_id)
         }
@@ -94,6 +104,8 @@ fn print_help() {
     println!("  interdriver-usb linux remote-list <host>");
     println!("  interdriver-usb linux attach <host> <bus-id>");
     println!("  interdriver-usb linux detach <port>");
+    println!("  interdriver-usb windows list");
+    println!("  interdriver-usb windows export <bus-id> [port]");
     println!("  interdriver-usb macos attach <host> <bus-id>");
     println!("  interdriver-usb linux export <bus-id> [port]");
     println!("  interdriver-usb probe <host> <bus-id>");
@@ -260,6 +272,52 @@ fn linux_detach(port: &str) -> Result<(), String> {
 #[cfg(not(target_os = "linux"))]
 fn linux_detach(_port: &str) -> Result<(), String> {
     Err("Linux adapter is unavailable on this platform".into())
+}
+
+#[cfg(target_os = "windows")]
+fn windows_list() -> Result<(), String> {
+    use interdriver_usbip_server::DeviceProvider as _;
+
+    let devices = interdriver_platform_windows::WinUsbProvider::new()
+        .list()
+        .map_err(|error| error.to_string())?;
+    if devices.is_empty() {
+        println!("No WinUSB-bound devices found.");
+    }
+    for description in devices {
+        println!(
+            "{}\t{:04x}:{:04x}\tinterfaces={}",
+            description.device.bus_id().unwrap_or("invalid"),
+            description.device.vendor_id,
+            description.device.product_id,
+            description.interfaces.len()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn windows_list() -> Result<(), String> {
+    Err("Windows adapter is unavailable on this platform".into())
+}
+
+#[cfg(target_os = "windows")]
+fn windows_export(bus_id: &str, port: u16) -> Result<(), String> {
+    use std::net::TcpListener;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    let provider = Arc::new(interdriver_platform_windows::WinUsbProvider::for_device(bus_id));
+    let listener =
+        TcpListener::bind(("0.0.0.0", port)).map_err(|error| format!("bind {port}: {error}"))?;
+    eprintln!("exporting {bus_id} over WinUSB on port {port}; press Ctrl-C to stop");
+    interdriver_usbip_server::serve(listener, provider, Arc::new(AtomicBool::new(false)))
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn windows_export(_bus_id: &str, _port: u16) -> Result<(), String> {
+    Err("Windows adapter is unavailable on this platform".into())
 }
 
 #[cfg(target_os = "macos")]

@@ -4,6 +4,7 @@ members = [
     "crates/driver-core",
     "crates/platform-linux",
     "crates/platform-macos",
+    "crates/platform-windows",
     "crates/usbip-client",
     "crates/usbip-protocol",
     "crates/usbip-server",

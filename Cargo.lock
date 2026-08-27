@@ -55,12 +55,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "interdriver-platform-windows"
+version = "0.1.0"
+dependencies = [
+ "interdriver-usbip-protocol",
+ "interdriver-usbip-server",
+ "windows-sys",
+]
+
+[[package]]
 name = "interdriver-usb"
 version = "0.1.0"
 dependencies = [
  "interdriver-driver-core",
  "interdriver-platform-linux",
  "interdriver-platform-macos",
+ "interdriver-platform-windows",
  "interdriver-usbfs-linux",
  "interdriver-usbip-server",
  "interdriver-usbip-session",
