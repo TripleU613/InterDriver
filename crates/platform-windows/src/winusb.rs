@@ -66,7 +66,7 @@ impl DeviceProvider for WinUsbProvider {
             let device = match OpenDevice::open(&found.path) {
                 Ok(device) => device,
                 Err(error) => {
-                    eprintln!("skip {}: {error}", found.bus_id);
+                    eprintln!("skip {} [{}]: {error}", found.bus_id, found.class);
                     continue;
                 }
             };

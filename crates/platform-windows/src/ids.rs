@@ -41,6 +41,36 @@ pub fn parse_interface_number(text: &str) -> Option<u8> {
     u8::from_str_radix(&digits, 16).ok()
 }
 
+/// The devnode portion of an interface path: everything before the trailing
+/// `#{guid}`. One devnode can publish several interface classes, which surfaces
+/// the same physical interface under several paths differing only in that
+/// suffix.
+#[must_use]
+pub fn devnode_of(path: &str) -> String {
+    let trimmed = match path.rfind('#') {
+        Some(index) => &path[..index],
+        None => path,
+    };
+    trimmed.to_ascii_lowercase()
+}
+
+/// Windows has no USB/IP bus IDs, so the interface path's instance segment is
+/// sanitised into a stable identifier that `open` can match back to the path.
+/// `8&10379175&1&0001` becomes `8_10379175_1_0001`.
+#[must_use]
+pub fn bus_id_from_path(path: &str) -> String {
+    let instance = path
+        .split('#')
+        .nth(2)
+        .or_else(|| path.split('#').nth(1))
+        .unwrap_or(path);
+    instance
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .take(31)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -62,6 +92,21 @@ mod tests {
             Some(1)
         );
         assert_eq!(parse_interface_number("USB\\VID_05AC&PID_12A8"), None);
+    }
+
+    #[test]
+    fn one_devnode_published_under_two_guids_collapses_to_one() {
+        let winusb = r"\\?\usb#vid_05ac&pid_12a8&mi_01#8&10379175&1&0001#{dee824ef-729b-4a0e-9c14-b7117d33a817}";
+        let apple = r"\\?\usb#vid_05ac&pid_12a8&mi_01#8&10379175&1&0001#{664be590-54bd-4964-8a8c-6cd1314f6dc2}";
+        assert_eq!(devnode_of(winusb), devnode_of(apple));
+        let other = r"\\?\usb#vid_05ac&pid_12a8&mi_01#8&99999999&1&0001#{dee824ef-729b-4a0e-9c14-b7117d33a817}";
+        assert_ne!(devnode_of(winusb), devnode_of(other));
+    }
+
+    #[test]
+    fn derives_a_stable_bus_id_from_an_interface_path() {
+        let path = r"\\?\usb#vid_05ac&pid_12a8&mi_01#8&10379175&1&0001#{dee824ef-729b-4a0e-9c14-b7117d33a817}";
+        assert_eq!(bus_id_from_path(path), "8_10379175_1_0001");
     }
 
     #[test]

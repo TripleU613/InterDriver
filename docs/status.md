@@ -134,6 +134,50 @@ single largest remaining piece and is properly its own driver-signing project.
   removed so the importer compiles. Nothing referenced them.
 - Windows importer. Presenting a virtual device to iTunes on Windows needs a
   UDE/UDECX kernel driver with signing. Not started.
+### Windows export — WORKING (proven on hardware 2026-08-27)
+
+`interdriver-usb windows export <bus-id> [port]` on `win-test` exports the attached
+iPhone, and Linux imports it:
+
+```
+win-test:   8_10379175_1_0001   05ac:12a8   interfaces=1
+work: interdriver-usb probe 127.0.0.1 8_10379175_1_0001
+      id 05ac:12a8   configurations 4   usb 2.00
+```
+
+Three things had to be right, each found by testing rather than assuming:
+
+1. **Interface GUID.** `GUID_DEVINTERFACE_USB_DEVICE` returns only usbccgp
+   composite parents. The exporter now enumerates several interface classes:
+   the generic WinUSB class, Apple's own `{664be590-...}`, and our INF's
+   `{D72D1A95-...}`, deduplicating by devnode.
+2. **Apple's upper filters.** The MI_01 devnode has `Service = WINUSB` but also
+   `UpperFilters = WUDFRd, AppleKmdfFilter`. The UMDF reflector refuses generic
+   `CreateFileW`, which returns ERROR_NOT_SUPPORTED (50) on *every* interface
+   GUID and access/flag combination. Removing `UpperFilters` and cycling the
+   composite parent rebuilds the devnode as plain WinUSB and the open succeeds.
+   This is not a reboot problem and not the Apple Mobile Device Service — both
+   were tested and excluded.
+3. **Accepted-socket blocking mode.** Windows returns an accepted socket that
+   inherits the listener's non-blocking mode; Linux does not. `serve_authorized`
+   now forces blocking mode, without which every request failed intermittently
+   with a truncated or empty reply.
+
+`win-test` is currently left with `UpperFilters` removed so export works. That may
+degrade iTunes/Apple Mobile Device integration for that iPhone on that box.
+Undo with `C:\Windows\Temp\gt\restore-apple.ps1` (restores the two filters and
+cycles the device).
+
+### Windows import — needs the gadget board, not a driver
+
+There is no user-space path: presenting a virtual USB device to Windows requires
+either a KMDF/UdeCx virtual-controller driver (WDK, EV signing, HLK — a separate
+project, see below) or real hardware. The gadget approach covers it: a Linux
+board in `raw-gadget` mode plugged into the Windows host is enumerated by
+Windows' in-box class drivers with no InterDriver driver installed at all. That is
+the same board and the same bridge as the macOS import path, so one piece of
+hardware serves both. Unproven on a real host — see `gadget-approach.md`.
+
 - Windows exporter (`platform-windows`, WinUSB): the exe runs on `win-test`,
   enumeration now finds the WinUSB `MI_01` interface (fixed: enumerate the
   standard WinUSB device-interface GUID `{DEE824EF-...}`, not

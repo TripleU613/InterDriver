@@ -1,4 +1,4 @@
-use crate::ids::{parse_hardware_id, parse_interface_number};
+use crate::ids::{bus_id_from_path, devnode_of, parse_hardware_id, parse_interface_number};
 use std::io;
 use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
     DIGCF_DEVICEINTERFACE, DIGCF_PRESENT, HDEVINFO, SP_DEVICE_INTERFACE_DATA,
@@ -7,16 +7,45 @@ use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
 };
 use windows_sys::core::GUID;
 
-/// The device-interface class Windows registers for every WinUSB-bound
-/// function, including the interface an iPhone exposes once `MI_01` is on
-/// WinUSB. `GUID_DEVINTERFACE_USB_DEVICE` only returns composite parents, which
-/// are owned by usbccgp and cannot be opened with WinUSB.
-const GUID_DEVINTERFACE_WINUSB: GUID = GUID {
-    data1: 0xdee824ef,
-    data2: 0x729b,
-    data3: 0x4a0e,
-    data4: [0x9c, 0x14, 0xb7, 0x11, 0x7d, 0x33, 0xa8, 0x17],
-};
+/// Device-interface classes worth trying, in priority order.
+///
+/// A WinUSB-bound function is normally reachable through the generic WinUSB
+/// class, but a device whose INF publishes its own `DeviceInterfaceGUIDs` is
+/// only reachable through that GUID. An iPhone on Apple's stock driver
+/// publishes `{664be590-...}` and has `WUDFRd`/`AppleKmdfFilter` above it, so
+/// opening the generic WinUSB interface reports ERROR_NOT_SUPPORTED even though
+/// the devnode's service really is WINUSB. `GUID_DEVINTERFACE_USB_DEVICE` is
+/// deliberately absent: it returns composite parents owned by usbccgp, which
+/// WinUSB cannot open at all.
+const INTERFACE_CLASSES: [(&str, GUID); 3] = [
+    (
+        "winusb",
+        GUID {
+            data1: 0xdee824ef,
+            data2: 0x729b,
+            data3: 0x4a0e,
+            data4: [0x9c, 0x14, 0xb7, 0x11, 0x7d, 0x33, 0xa8, 0x17],
+        },
+    ),
+    (
+        "apple-mobile-device",
+        GUID {
+            data1: 0x664be590,
+            data2: 0x54bd,
+            data3: 0x4964,
+            data4: [0x8a, 0x8c, 0x6c, 0xd1, 0x31, 0x4f, 0x6d, 0xc2],
+        },
+    ),
+    (
+        "interdriver-winusb",
+        GUID {
+            data1: 0xd72d1a95,
+            data2: 0x9a65,
+            data3: 0x4f2b,
+            data4: [0x8b, 0x17, 0x2f, 0x1a, 0x3d, 0x8b, 0x8a, 0x1c],
+        },
+    ),
+];
 
 /// One WinUSB-accessible interface, addressed by the device-interface path that
 /// `CreateFileW` opens.
@@ -26,6 +55,8 @@ pub struct FoundDevice {
     pub vendor_id: u16,
     pub product_id: u16,
     pub interface_number: u8,
+    /// Which interface class surfaced this path, for diagnostics.
+    pub class: &'static str,
 }
 
 struct DeviceInfoList(HDEVINFO);
@@ -37,9 +68,25 @@ impl Drop for DeviceInfoList {
 }
 
 pub fn list_devices() -> io::Result<Vec<FoundDevice>> {
+    let mut devices = Vec::new();
+    for (name, guid) in INTERFACE_CLASSES {
+        match list_by_class(name, &guid) {
+            Ok(found) => devices.extend(found),
+            Err(error) => eprintln!("enumerating {name}: {error}"),
+        }
+    }
+    // One devnode can publish several interface classes, which surfaces the
+    // same physical interface under several paths differing only in their GUID
+    // suffix. Deduplicate on the devnode part so it is offered once.
+    devices.sort_by(|left, right| left.bus_id.cmp(&right.bus_id));
+    devices.dedup_by(|left, right| devnode_of(&left.path) == devnode_of(&right.path));
+    Ok(devices)
+}
+
+fn list_by_class(class: &'static str, guid: &GUID) -> io::Result<Vec<FoundDevice>> {
     let handle = unsafe {
         SetupDiGetClassDevsW(
-            &GUID_DEVINTERFACE_WINUSB,
+            guid,
             std::ptr::null(),
             std::ptr::null_mut(),
             DIGCF_PRESENT | DIGCF_DEVICEINTERFACE,
@@ -55,18 +102,12 @@ pub fn list_devices() -> io::Result<Vec<FoundDevice>> {
     loop {
         let mut interface = SP_DEVICE_INTERFACE_DATA {
             cbSize: size_of::<SP_DEVICE_INTERFACE_DATA>() as u32,
-            InterfaceClassGuid: GUID_DEVINTERFACE_WINUSB,
+            InterfaceClassGuid: *guid,
             Flags: 0,
             Reserved: 0,
         };
         let found = unsafe {
-            SetupDiEnumDeviceInterfaces(
-                list.0,
-                std::ptr::null(),
-                &GUID_DEVINTERFACE_WINUSB,
-                index,
-                &mut interface,
-            )
+            SetupDiEnumDeviceInterfaces(list.0, std::ptr::null(), guid, index, &mut interface)
         };
         if found == 0 {
             break;
@@ -86,9 +127,9 @@ pub fn list_devices() -> io::Result<Vec<FoundDevice>> {
             vendor_id,
             product_id,
             interface_number,
+            class,
         });
     }
-    devices.sort_by(|left, right| left.bus_id.cmp(&right.bus_id));
     Ok(devices)
 }
 
@@ -134,32 +175,4 @@ fn interface_path(
         std::slice::from_raw_parts(buffer.as_ptr().cast::<u8>(), buffer.len() * size_of::<u32>())
     };
     Ok(Some(crate::ids::wide_string_at(&bytes[size_of::<u32>()..])))
-}
-
-/// Windows has no USB/IP bus IDs, so the device-interface path's instance
-/// segment is sanitised into a stable identifier that `open` can match back to
-/// the same path. Example path segment `8&10379175&1&0001` becomes
-/// `8_10379175_1_0001`.
-fn bus_id_from_path(path: &str) -> String {
-    let instance = path
-        .split('#')
-        .nth(2)
-        .or_else(|| path.split('#').nth(1))
-        .unwrap_or(path);
-    let sanitized: String = instance
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-        .collect();
-    sanitized.chars().take(31).collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn derives_a_stable_bus_id_from_an_interface_path() {
-        let path = r"\\?\usb#vid_05ac&pid_12a8&mi_01#8&10379175&1&0001#{dee824ef-729b-4a0e-9c14-b7117d33a817}";
-        assert_eq!(bus_id_from_path(path), "8_10379175_1_0001");
-    }
 }

@@ -81,6 +81,13 @@ pub fn serve_authorized(
     while !shutdown.load(Ordering::Acquire) {
         match listener.accept() {
             Ok((stream, _)) => {
+                // Windows hands back an accepted socket that inherits the
+                // listener's non-blocking mode, so every read would fail with
+                // WouldBlock; Linux does not inherit it. Force blocking mode.
+                if let Err(error) = stream.set_nonblocking(false) {
+                    eprintln!("cannot set accepted socket blocking: {error}");
+                    continue;
+                }
                 let provider = Arc::clone(&provider);
                 let authorizer = authorizer.clone();
                 thread::Builder::new()
