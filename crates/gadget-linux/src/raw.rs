@@ -261,8 +261,14 @@ pub fn ep_write(fd: BorrowedFd<'_>, handle: u16, data: &[u8]) -> io::Result<usiz
 
 /// Enables a non-zero endpoint from its 7-byte endpoint descriptor; returns the
 /// handle used by `ep_read`/`ep_write`.
+///
+/// `struct usb_endpoint_descriptor` is nine bytes because audio endpoints carry
+/// bRefresh and bSynchAddress, and the ioctl copies all nine from user space,
+/// so the descriptor is padded rather than passed as the seven bytes a
+/// non-audio endpoint uses.
 pub fn ep_enable(fd: BorrowedFd<'_>, descriptor: &[u8; 7]) -> io::Result<u16> {
-    let mut buffer = *descriptor;
+    let mut buffer = [0_u8; 9];
+    buffer[..7].copy_from_slice(descriptor);
     let handle = ioctl(fd, USB_RAW_IOCTL_EP_ENABLE, buffer.as_mut_ptr().cast())?;
     Ok(handle as u16)
 }
