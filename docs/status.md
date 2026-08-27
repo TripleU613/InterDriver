@@ -41,17 +41,26 @@ it is the critical path, not more code. Do not disable SIP on the release Mac.
 - A submitted transfer occupies a thread until it completes or the 30 second
   timeout expires, and `cancel` cannot interrupt it. `ipheth` reading an idle
   iPhone therefore reports `-110`, which is correct but wasteful.
-- usbmuxd segfaults when exporter and importer are the same host, because it
-  sees the physical and the virtual iPhone with one identical UDID. This is a
-  test artefact, not a product path. Proving Apple tooling end to end needs a
-  second machine with `usbip` and `vhci_hcd`.
+- usbmuxd segfaults when exporter and importer are the same host. The likely
+  cause is two devices with one identical UDID on the same daemon, which would
+  make it a test artefact rather than a product path, but this is unconfirmed:
+  the crash is in usbmuxd's own stripped frames. Proving Apple tooling end to
+  end needs a second machine with `usbip` and `vhci_hcd`, which also settles
+  the cause. Until then, treat it as an open question, not a closed one.
 
 ## Not Yet Written
 
 - macOS exporter. Codex declared `mod exporter` with `list_physical_devices`
   and `serve_physical` and never wrote the file. The two dead re-exports were
   removed so the importer compiles. Nothing referenced them.
-- Windows exporter and importer. No crate exists.
+- Windows importer. Presenting a virtual device to iTunes on Windows needs a
+  UDE/UDECX kernel driver with signing. Not started.
+- Windows exporter is written (`platform-windows`, WinUSB) and cross-compiles,
+  but is unrun. Open risk: WinUSB binds one interface, and an iPhone is
+  composite with three. If `interdriver-usb windows list` reports one interface for
+  the iPhone, the exporter needs one WinUSB handle per `MI_xx` interface
+  instead of walking associated interfaces from a single handle. The shipped
+  InterDriver INF binds only `MI_01`, so this is likely. Test before trusting.
 - `usbip-server`'s `DeviceProvider`/`DeviceSession` have test mocks only, so the
   Rust server is in no data path. `platform-linux::serve` shells out to the
   system `usbipd` binary instead.
