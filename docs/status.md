@@ -78,9 +78,29 @@ magic cannot collide with a USB/IP header (whose first bytes are version
 device descriptor, wrong ticket and no ticket are both dropped before any device
 is touched.
 
+## Networked Broker (verified on hardware)
+
+The exporter's `Authorizer` now talks to a live broker over TCP instead of
+holding a pre-shared token. `control-plane::net` speaks a two-verb line
+protocol: `ISSUE` (operator) and `REDEEM` (exporter). The exporter redeems the
+ticket the importer presented — a capability model: possession of the token,
+delivered out of band by whoever issued it, is the importer's authorization; the
+exporter is the party the broker binds and can authenticate. `redeem` reports
+`Allow` / `Deny` / `Unreachable` as three distinct outcomes, and the exporter
+logs a denied ticket differently from an unreachable broker.
+
+CLI: `interdriver-usb broker <port>`, `interdriver-usb issue <broker> <device>
+<exporter> <importer> [ttl]`, and `interdriver-usb linux export <bus> [port]
+--broker <addr> --exporter <id>`.
+
+Verified three-party on real hardware (broker + exporter + operator + importer,
+four processes): broker issues -> importer probes -> exporter redeems via broker
+-> webcam descriptor returned; a reused ticket is denied "already redeemed" and
+an unissued token "no session matches" — single-use enforced across the network.
+
 Still to wire: transport (carry USB/IP inside mutually authenticated TLS/QUIC),
-and connecting the exporter's `Authorizer` to a live `Broker` over the network
-instead of a single pre-shared token.
+and authenticating the operator to the broker (today the ISSUE verb is
+unauthenticated — do not expose the broker port off a trusted network).
 
 ## Not Yet Written
 

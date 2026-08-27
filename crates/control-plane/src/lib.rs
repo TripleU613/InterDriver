@@ -9,6 +9,7 @@
 //! there is no ambient clock.
 
 mod token;
+pub mod net;
 
 pub use token::Token;
 
@@ -167,6 +168,40 @@ impl Broker {
         })
     }
 
+    /// Redeems a ticket on the exporter's behalf. The exporter is the party
+    /// that receives the token over the data-plane handshake, so it — not the
+    /// importer — drives redemption over the network. Same single-use, TTL, and
+    /// not-live rules as `redeem`; binds to the exporter the ticket was issued
+    /// for.
+    pub fn redeem_for_exporter(
+        &mut self,
+        token: &Token,
+        exporter: &PeerId,
+        now: u64,
+    ) -> Result<Grant, Error> {
+        let session = self
+            .sessions
+            .get_mut(&token.to_hex())
+            .ok_or(Error::UnknownToken)?;
+        match session.state {
+            SessionState::Issued => {}
+            SessionState::Active => return Err(Error::AlreadyRedeemed),
+            SessionState::Released | SessionState::Revoked => return Err(Error::NotLive),
+        }
+        if now >= session.expires_at {
+            session.state = SessionState::Released;
+            return Err(Error::Expired);
+        }
+        if session.exporter != *exporter {
+            return Err(Error::WrongImporter);
+        }
+        session.state = SessionState::Active;
+        Ok(Grant {
+            device: session.device.clone(),
+            exporter: session.exporter.clone(),
+        })
+    }
+
     /// Force-revokes a session. Returns the device that must be released, or
     /// `UnknownToken`. Idempotent for an already-revoked session.
     pub fn revoke(&mut self, token: &Token) -> Result<DeviceKey, Error> {
@@ -300,6 +335,27 @@ mod tests {
         let stray = Token::from_bytes([7; 32]);
         assert_eq!(b.redeem(&stray, &mac(), 0), Err(Error::UnknownToken));
         assert_eq!(b.revoke(&stray), Err(Error::UnknownToken));
+    }
+
+    #[test]
+    fn exporter_redeem_is_single_use_and_exporter_bound() {
+        let mut b = broker();
+        let ticket = b.issue(dev(), edge(), mac(), 0, 60).unwrap();
+        // wrong exporter rejected
+        assert_eq!(
+            b.redeem_for_exporter(&ticket.token, &PeerId("other-edge".into()), 1),
+            Err(Error::WrongImporter)
+        );
+        // correct exporter redeems once
+        assert_eq!(
+            b.redeem_for_exporter(&ticket.token, &edge(), 2).map(|g| g.device),
+            Ok(dev())
+        );
+        // second redeem fails (single-use survives)
+        assert_eq!(
+            b.redeem_for_exporter(&ticket.token, &edge(), 3),
+            Err(Error::AlreadyRedeemed)
+        );
     }
 
     #[test]
