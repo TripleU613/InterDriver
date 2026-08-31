@@ -329,7 +329,19 @@ are signed int32; the doorbell is unsigned uint32) — commit 298a3ee.
 of control-endpoint transfers complete successfully (device descriptor, every
 configuration descriptor, string descriptors, status stages).
 
-**Open blocker (precisely characterized):** `AppleUSBHostiOSDevice` (the bridge
+**Root cause pinned to one USB request (2026-08-31 follow-up):** the failing
+control transfer is Apple vendor request `bmRequestType=0xc0 bRequest=0x45`
+(device->host, 4 bytes), sent right after macOS reads the configuration
+descriptors and before any SET_CONFIGURATION. The remote answers it correctly
+(4 bytes, status SUCCESS), but `enqueueTransferCompletionForMessage` rejects the
+completion with `-536870174 "message was not sent"`, even though the message
+matches `currentTransferMessage`. Making the completion non-fatal (dropping the
+superseded transfer) is NOT a valid fix: the host needs that answer, so with the
+drop the device stops presenting entirely. The completion must be made to
+succeed — a subtle IOUSBHostCI control-transfer discipline detail specific to a
+vendor request. This needs the controller author or focused Apple-doc study.
+
+**Earlier characterization:** `AppleUSBHostiOSDevice` (the bridge
 to AMDevice/usbmuxd that `cfgutil` reads) stalls at `!registered`. The daemon
 fails one control-endpoint (`ep 0x00`) transfer completion with
 `IOUSBHostErrorDomain code=-536870174 "Transfer completion message was not
