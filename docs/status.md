@@ -343,3 +343,28 @@ IOUSBHostCI control-transfer discipline (SETUP→DATA→STATUS ordering).
 
 **Hedge:** `gadget-linux` presents a remote device over real USB hardware and
 sidesteps this cell entirely.
+
+## Delivered: Mutual-TLS transport (2026-08-31)
+
+`interdriver-tls` — rustls mTLS with in-process CA + peer cert generation
+(rcgen/ring), PEM persistence, cross-compiles to Windows and macOS.
+
+- **Control-plane API over mTLS**: broker ISSUE/REDEEM carried over mutually
+  authenticated TLS; a peer from a different CA is rejected at handshake;
+  single-use redemption holds over the encrypted channel.
+- **Data-plane mTLS tunnel**: `tunnel::serve`/`forward` wrap the USB/IP data
+  plane in mutual TLS with no change to the USB/IP engine. A single-threaded
+  non-blocking pump keeps one rustls session on one thread.
+- **CLI**: `tls init` (generate CA + exporter/importer identities), `tls serve`,
+  `tls forward`. Verified on hardware — a USB device descriptor flows through
+  the full tunnel (`probe -> forward -> mutual TLS -> serve -> exporter ->
+  webcam`) byte-correct.
+
+## Delivered: Windows import verified live (2026-08-31)
+
+The `InterDriver Virtual USB Host Controller` (UdeCx) driver is loaded on the
+Windows test box. A webcam attached to the Linux box was imported over the
+tunnel: `windows attach` pulled the 18-byte device descriptor and 1771-byte
+configuration, and Windows enumerated it as a real composite USB device
+(`SD webcam 5160` + `USB Microphone` + `USB Composite Device`, all OK). The
+remote Linux device works as a real device on Windows.
