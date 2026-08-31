@@ -1,6 +1,8 @@
 use block2::{DynBlock, RcBlock};
 use interdriver_usbip_protocol::{Direction, IsoPacketDescriptor};
-use interdriver_usbip_session::{Session, TransferCompletion, TransferError, TransferRequest};
+use interdriver_usbip_session::{
+    Error as SessionError, Session, TransferCompletion, TransferError, TransferRequest,
+};
 use objc2::rc::{Allocated, Retained, autoreleasepool};
 use objc2::runtime::{AnyObject, NSObject};
 use objc2::{AnyThread, Encode, Encoding, RefEncode, extern_class, extern_methods};
@@ -60,6 +62,8 @@ const MESSAGE_STATUS_ENDPOINT_STOPPED: i32 = 7;
 const MESSAGE_STATUS_OVERRUN: i32 = 10;
 const MESSAGE_STATUS_STALL: i32 = 11;
 const MESSAGE_STATUS_ERROR: i32 = 13;
+const ENDPOINT_STATE_ACTIVE: i32 = 3;
+const TRANSFER_COMPLETION_NOT_SENT: isize = -536870174;
 const DEVICE_SPEED_NONE: u32 = 0;
 const DEVICE_SPEED_HIGH: u32 = 3;
 const LINK_STATE_U0: u32 = 0;
@@ -304,6 +308,9 @@ impl IOUSBHostCIEndpointStateMachine {
 
         #[unsafe(method(currentTransferMessage))]
         fn current_transfer_message(&self) -> *const IOUSBHostCIMessage;
+
+        #[unsafe(method(endpointState))]
+        fn endpoint_state(&self) -> i32;
     );
 }
 
@@ -700,6 +707,9 @@ impl MacController {
         let Some(endpoint) = self.endpoints.get_mut(&key) else {
             return Ok(());
         };
+        let mut error = std::ptr::null_mut();
+        let accepted = unsafe { endpoint.state_machine.inspect_command(&command, &mut error) };
+        ensure_accepted(accepted, error, "endpoint command inspection")?;
         if let Some(sequence) = endpoint.pending_sequence {
             if endpoint.deferred_command.is_some() {
                 return Err(format!(
@@ -709,19 +719,26 @@ impl MacController {
             }
             endpoint.deferred_command = Some(command);
             if let Some(session) = &self.session {
-                let unlink = session
-                    .unlink(sequence)
-                    .map_err(|error| error.to_string())?;
-                thread::Builder::new()
-                    .name("interdriver-usbip-unlink".into())
-                    .spawn(move || {
-                        let _ = unlink.wait_timeout(Duration::from_secs(5));
-                    })
-                    .map_err(|error| error.to_string())?;
+                match session.unlink(sequence) {
+                    Ok(unlink) => {
+                        thread::Builder::new()
+                            .name("interdriver-usbip-unlink".into())
+                            .spawn(move || {
+                                let _ = unlink.wait_timeout(Duration::from_secs(5));
+                            })
+                            .map_err(|error| error.to_string())?;
+                    }
+                    Err(SessionError::InvalidRequest("target transfer is not pending")) => {}
+                    Err(error) => return Err(error.to_string()),
+                }
             }
             return Ok(());
         }
-        self.respond_endpoint_command(key, command)
+        self.respond_endpoint_command(key, command)?;
+        if self.endpoints.contains_key(&key) {
+            self.drive_endpoint(key)?;
+        }
+        Ok(())
     }
 
     fn respond_endpoint_command(
@@ -734,9 +751,6 @@ impl MacController {
             return Ok(());
         };
         let mut error = std::ptr::null_mut();
-        let accepted = unsafe { endpoint.state_machine.inspect_command(&command, &mut error) };
-        ensure_accepted(accepted, error, "endpoint command inspection")?;
-        error = std::ptr::null_mut();
         let responded = unsafe {
             endpoint
                 .state_machine
@@ -782,6 +796,9 @@ impl MacController {
         endpoint: &mut Endpoint,
     ) -> Result<(), String> {
         while endpoint.pending_sequence.is_none() {
+            if endpoint.state_machine.endpoint_state() != ENDPOINT_STATE_ACTIVE {
+                return Ok(());
+            }
             let pointer = endpoint.state_machine.current_transfer_message();
             if pointer.is_null() {
                 return Ok(());
@@ -810,7 +827,7 @@ impl MacController {
                     }
                 }
                 MESSAGE_TYPE_STATUS_TRANSFER => {
-                    let Some(setup) = endpoint.setup.take() else {
+                    let Some(setup) = endpoint.setup else {
                         if !no_response {
                             complete_endpoint_transfer(
                                 &endpoint.state_machine,
@@ -836,6 +853,7 @@ impl MacController {
                             request,
                         )?;
                     } else if !no_response {
+                        endpoint.setup = None;
                         complete_endpoint_transfer(
                             &endpoint.state_machine,
                             pointer,
@@ -1006,7 +1024,14 @@ impl MacController {
         };
         endpoint.pending_sequence = None;
 
+        let stopped = endpoint
+            .deferred_command
+            .as_ref()
+            .is_some_and(endpoint_command_stops_transfer);
+        let inactive = endpoint.state_machine.endpoint_state() != ENDPOINT_STATE_ACTIVE;
         let (status, actual_length) = match result {
+            _ if inactive => (MESSAGE_STATUS_ENDPOINT_STOPPED, 0),
+            _ if stopped => (MESSAGE_STATUS_ENDPOINT_STOPPED, 0),
             Ok(completion) => {
                 if completion.actual_length > requested_length {
                     return Err(format!(
@@ -1037,9 +1062,6 @@ impl MacController {
                     usbip_status_to_ci(completion.status),
                     completion.actual_length,
                 )
-            }
-            Err(TransferError::Cancelled) if endpoint.deferred_command.is_some() => {
-                (MESSAGE_STATUS_ENDPOINT_STOPPED, 0)
             }
             Err(TransferError::Cancelled | TransferError::Connection(_)) => {
                 (MESSAGE_STATUS_OFFLINE, 0)
@@ -1170,9 +1192,25 @@ fn complete_endpoint_transfer(
     status: i32,
     length: usize,
 ) -> Result<(), String> {
+    if state_machine.endpoint_state() != ENDPOINT_STATE_ACTIVE {
+        return Ok(());
+    }
     let mut error = std::ptr::null_mut();
     let completed = unsafe { state_machine.complete_transfer(message, status, length, &mut error) };
+    if !completed
+        && unsafe { error.as_ref() }
+            .is_some_and(|error| error.code() == TRANSFER_COMPLETION_NOT_SENT)
+    {
+        return Ok(());
+    }
     ensure_accepted(completed, error, "endpoint transfer completion")
+}
+
+fn endpoint_command_stops_transfer(command: &IOUSBHostCIMessage) -> bool {
+    matches!(
+        command.control & MESSAGE_TYPE_MASK,
+        MESSAGE_TYPE_ENDPOINT_PAUSE | MESSAGE_TYPE_ENDPOINT_RESET
+    )
 }
 
 fn device_address(message: &IOUSBHostCIMessage) -> u8 {
