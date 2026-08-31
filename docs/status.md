@@ -187,7 +187,29 @@ degrade iTunes/Apple Mobile Device integration for that iPhone on that box.
 Undo with `C:\Windows\Temp\gt\restore-apple.ps1` (restores the two filters and
 cycles the device).
 
-### Windows import — needs the gadget board, not a driver
+### Windows import — a remote device now enumerates on Windows
+
+The UdeCx driver plugs in a device built from descriptors captured off the real
+remote device. Verified on `win-test` with the Linux webcam exported over a reverse
+SSH tunnel:
+
+```
+win-test:   attached 3-11 from 127.0.0.1: 18 byte device descriptor, 1771 byte configuration
+      USB\VID_0C45&PID_6340\2&1B8366BC&0&1     <- the Linux webcam, on Windows
+      InterDriver Virtual USB Host Controller  OK
+```
+
+Windows enumerated a device that is physically attached to another machine, with
+no hardware and no purchased toolchain. The device still reports an error
+because endpoint 0 URBs are answered `STATUS_NOT_IMPLEMENTED`; forwarding those
+to the user-mode service (which already holds the USB/IP session) is the
+remaining work.
+
+The earlier bugcheck is fixed and did not recur: hotpatch metadata
+(`_guard_*_$fo_*$`, `memset_$fo_*$`) is merged into `.data` rather than
+read-only `.rdata`.
+
+### Windows import — the gadget board remains a hardware alternative
 
 There is no user-space path: presenting a virtual USB device to Windows requires
 either a KMDF/UdeCx virtual-controller driver (WDK, EV signing, HLK — a separate
