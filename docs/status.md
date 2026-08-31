@@ -314,3 +314,32 @@ hardware serves both. Unproven on a real host — see `gadget-approach.md`.
 
 Restore any bound device with `usbip unbind -b <bus-id>`, then
 `systemctl restart usbmuxd` for Apple devices.
+
+## macOS Import — Runs and Presents the Device (2026-08-31)
+
+With SIP off + `amfi_get_out_of_my_way=1` + ad-hoc signing with
+`entitlements.plist`, the importer runs (the managed entitlement is no longer
+enforced). Fixed three latent u32/i32 signedness bugs in the controller FFI that
+had never surfaced because AMFI blocked the path (message status and link state
+are signed int32; the doorbell is unsigned uint32) — commit 298a3ee.
+
+**Result:** the Mac presents a virtual iPhone with the real remote serial
+(`4a6fbe05…`, the iPhone attached to the Linux exporter), matched in IOKit under
+`AppleUSBUserHCIPort`, `bNumConfigurations=4`. Enumeration runs deeply — dozens
+of control-endpoint transfers complete successfully (device descriptor, every
+configuration descriptor, string descriptors, status stages).
+
+**Open blocker (precisely characterized):** `AppleUSBHostiOSDevice` (the bridge
+to AMDevice/usbmuxd that `cfgutil` reads) stalls at `!registered`. The daemon
+fails one control-endpoint (`ep 0x00`) transfer completion with
+`IOUSBHostErrorDomain code=-536870174 "Transfer completion message was not
+sent."`. Diagnostics ruled out the obvious cause: the completed message DID
+match `currentTransferMessage` (pointer and content), and the failing transfer
+is identical in shape (`type=0x39` NORMAL, 4 bytes, `status=SUCCESS`) to dozens
+that just succeeded. This is a subtle control-transfer sequencing issue in the
+endpoint state machine (`drive_endpoint_inner` / `handle_transfer_finished`),
+not a signedness or pointer-staleness bug. Needs a focused pass on the
+IOUSBHostCI control-transfer discipline (SETUP→DATA→STATUS ordering).
+
+**Hedge:** `gadget-linux` presents a remote device over real USB hardware and
+sidesteps this cell entirely.
