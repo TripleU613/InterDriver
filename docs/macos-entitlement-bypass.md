@@ -44,6 +44,34 @@ Conclusion: the importer entitlement cannot be worked around remotely. The
 options are Apple granting it, a physical Recovery-mode step on a dev Mac, or
 the gadget board.
 
+## Independent confirmation
+
+`carlossless/usbip-macos` is a separate USB/IP client for macOS built on the
+same `IOUSBHostControllerInterface`. Its author reaches the identical
+conclusion: it "either needs to be signed with
+`com.apple.developer.usb.host-controller-interface` entitlement (which I don't
+have) or run as root on a system that has SIP disabled."
+
+VirtualHere, a commercial product, ships a virtual host-controller kernel
+extension (`vhhcd.kext`, now a system extension) instead, which needs Apple
+approval or Reduced Security.
+
+So there is no fourth door. macOS does not expose an unprivileged way to create
+a virtual USB device, and two independent implementations plus this one land in
+the same place.
+
+The entitlement is managed but is granted on request: it is absent from the
+Xcode capabilities panel only because request volume is low, and requests are
+submitted through Feedback Assistant with the Team ID. Reports are that the
+approving engineer turns them around quickly.
+
+## One command once SIP is off
+
+`scripts/macos-import-enable.sh` signs the controller probe with the entitlement,
+prints the machine's security posture, runs it, and interprets the result. On a
+Full Security machine it reports the AMFI kill and the exact Recovery steps; with
+SIP disabled it reports whether the controller was created.
+
 ## Two ways forward
 
 ### A. Local development / internal use — disable SIP + AMFI on a dev Mac
