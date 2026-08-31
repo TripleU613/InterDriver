@@ -48,6 +48,7 @@ EVT_WDF_IO_QUEUE_IO_INTERNAL_DEVICE_CONTROL GtEvtControlUrb;
 
 static NTSTATUS GtPlugIn(_In_ PGT_CONTROLLER Controller, _In_ PINTERDRIVER_UDE_PLUG_IN_REQUEST Request);
 static NTSTATUS GtUnplug(_In_ PGT_CONTROLLER Controller);
+static VOID GtDrainPendingUrbs(_In_ PGT_CONTROLLER Controller, _In_ NTSTATUS Status);
 
 /*
  * UdeCx asks which optional host capabilities the controller supports. The
@@ -316,31 +317,52 @@ GtUnplug(
 {
     NTSTATUS status;
 
-    ULONG index;
-
     if (Controller->Child == NULL) {
         return STATUS_DEVICE_NOT_CONNECTED;
     }
 
-    // Fail anything still parked before the emulated device goes away, so no
-    // slot keeps a request belonging to a deleted device.
-    WdfSpinLockAcquire(Controller->Lock);
-    for (index = 0; index < INTERDRIVER_UDE_MAX_PENDING; index++) {
-        if (Controller->Pending[index].InUse) {
-            WDFREQUEST urb = Controller->Pending[index].Request;
-            Controller->Pending[index].InUse = FALSE;
-            Controller->Pending[index].Request = NULL;
-            if (urb != NULL) {
-                UdecxUrbCompleteWithNtStatus(urb, STATUS_DEVICE_NOT_CONNECTED);
-            }
-        }
-    }
-    WdfSpinLockRelease(Controller->Lock);
+    GtDrainPendingUrbs(Controller, STATUS_DEVICE_NOT_CONNECTED);
 
     status = UdecxUsbDevicePlugOutAndDelete(Controller->Child);
     Controller->Child = NULL;
     Controller->Control = NULL;
     return status;
+}
+
+/*
+ * Detaches every outstanding URB from the bookkeeping table while holding the
+ * spin lock, then completes the requests after dropping it. UdeCx completion
+ * can synchronously run PnP teardown callbacks; completing while the lock is
+ * held therefore risks re-entry, deadlock, and access to an object whose
+ * teardown is already in progress.
+ */
+static VOID
+GtDrainPendingUrbs(
+    _In_ PGT_CONTROLLER Controller,
+    _In_ NTSTATUS Status
+    )
+{
+    WDFREQUEST requests[INTERDRIVER_UDE_MAX_PENDING];
+    ULONG count = 0;
+    ULONG index;
+
+    WdfSpinLockAcquire(Controller->Lock);
+    for (index = 0; index < INTERDRIVER_UDE_MAX_PENDING; index++) {
+        if (Controller->Pending[index].InUse) {
+            WDFREQUEST urb = Controller->Pending[index].Request;
+            Controller->Pending[index].InUse = FALSE;
+            Controller->Pending[index].Delivered = FALSE;
+            Controller->Pending[index].Request = NULL;
+            if (urb != NULL) {
+                requests[count++] = urb;
+            }
+        }
+    }
+    WdfSpinLockRelease(Controller->Lock);
+
+    for (index = 0; index < count; index++) {
+        UdecxUrbCompleteWithNtStatus(requests[index], Status);
+    }
 }
 
 VOID
@@ -367,10 +389,12 @@ GtEvtIoDeviceControl(
         if (!NT_SUCCESS(status)) {
             break;
         }
-        if (plug->DeviceDescriptorLength > INTERDRIVER_UDE_MAX_DESCRIPTOR ||
+        if (plug->Size != length ||
+            plug->DeviceDescriptorLength > INTERDRIVER_UDE_MAX_DESCRIPTOR ||
             plug->ConfigDescriptorLength > INTERDRIVER_UDE_MAX_DESCRIPTOR ||
-            length < sizeof(*plug) + plug->DeviceDescriptorLength +
-                     plug->ConfigDescriptorLength) {
+            plug->DeviceDescriptorLength > length - sizeof(*plug) ||
+            plug->ConfigDescriptorLength >
+                length - sizeof(*plug) - plug->DeviceDescriptorLength) {
             status = STATUS_INVALID_BUFFER_SIZE;
             break;
         }
@@ -414,7 +438,7 @@ GtEvtIoDeviceControl(
             break;
         }
         if (result->DataLength > INTERDRIVER_UDE_MAX_TRANSFER ||
-            length < sizeof(*result) + result->DataLength) {
+            result->DataLength > length - sizeof(*result)) {
             status = STATUS_INVALID_BUFFER_SIZE;
             break;
         }
@@ -524,7 +548,10 @@ GtEvtDeviceAdd(
         return status;
     }
 
-    WDF_IO_QUEUE_CONFIG_INIT_DEFAULT_QUEUE(&queueConfig, WdfIoQueueDispatchParallel);
+    // Serialize plug, unplug and completion IOCTLs. In particular, this keeps
+    // an explicit unplug from racing a late user-mode completion that still
+    // refers to the child being removed.
+    WDF_IO_QUEUE_CONFIG_INIT_DEFAULT_QUEUE(&queueConfig, WdfIoQueueDispatchSequential);
     queueConfig.EvtIoDeviceControl = GtEvtIoDeviceControl;
 
     return WdfIoQueueCreate(device, &queueConfig, WDF_NO_OBJECT_ATTRIBUTES, &queue);
