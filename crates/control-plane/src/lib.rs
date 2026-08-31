@@ -86,6 +86,18 @@ pub struct Grant {
     pub exporter: PeerId,
 }
 
+/// Non-secret snapshot of a session for operator listing. `token` is the hex
+/// id, not the secret bytes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionInfo {
+    pub token: String,
+    pub device: DeviceKey,
+    pub exporter: PeerId,
+    pub importer: PeerId,
+    pub state: SessionState,
+    pub expires_at: u64,
+}
+
 /// The ticket handed to both peers out of band. `token` is the secret; the rest
 /// is non-secret routing the peers use to find each other.
 pub struct Ticket {
@@ -226,6 +238,23 @@ impl Broker {
     #[must_use]
     pub fn state(&self, token: &Token) -> Option<SessionState> {
         self.sessions.get(&token.to_hex()).map(|s| s.state)
+    }
+
+    /// A snapshot of every known session for operator visibility. Expires stale
+    /// Issued tickets first so the listing reflects reality.
+    pub fn sessions(&mut self, now: u64) -> Vec<SessionInfo> {
+        self.expire_stale(now);
+        self.sessions
+            .iter()
+            .map(|(token, session)| SessionInfo {
+                token: token.clone(),
+                device: session.device.clone(),
+                exporter: session.exporter.clone(),
+                importer: session.importer.clone(),
+                state: session.state,
+                expires_at: session.expires_at,
+            })
+            .collect()
     }
 
     fn device_is_live(&self, device: &DeviceKey) -> bool {

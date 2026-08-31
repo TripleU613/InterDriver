@@ -114,6 +114,8 @@ fn run(mut args: Vec<String>) -> Result<(), String> {
                 .map_err(|_| "port must be an integer from 1 to 65535".to_string())?;
             run_broker(port)
         }
+        [command, addr] if command == "sessions" => run_sessions(addr),
+        [command, addr, token] if command == "revoke" => run_revoke(addr, token),
         [command, addr, device, exporter, importer] if command == "issue" => {
             run_issue(addr, device, exporter, importer, 300)
         }
@@ -172,6 +174,8 @@ fn print_help() {
     println!("  interdriver-usb tls forward <local-port> <remote-host:port> <server-name> <cert-dir>");
     println!("  interdriver-usb broker <port>");
     println!("  interdriver-usb issue <broker-addr> <device> <exporter> <importer> [ttl]");
+    println!("  interdriver-usb sessions <broker-addr>");
+    println!("  interdriver-usb revoke <broker-addr> <token>");
     println!("  interdriver-usb linux export <bus-id> [port] --broker <addr> --exporter <id>");
 }
 
@@ -226,6 +230,37 @@ fn run_broker(port: u16) -> Result<(), String> {
     let broker = Arc::new(Mutex::new(interdriver_control_plane::Broker::new()));
     eprintln!("control-plane broker listening on port {port}");
     interdriver_control_plane::net::serve(listener, broker).map_err(|error| error.to_string())
+}
+
+fn run_sessions(addr: &str) -> Result<(), String> {
+    let rows = interdriver_control_plane::net::list_sessions(addr, std::time::Duration::from_secs(5))
+        .map_err(|e| e.to_string())?;
+    if rows.is_empty() {
+        println!("no sessions");
+    }
+    println!("token\tdevice\texporter\timporter\tstate\texpires");
+    for row in rows {
+        let fields: Vec<&str> = row.split('|').collect();
+        if fields.len() == 6 {
+            println!(
+                "{}\t{}\t{}\t{}\t{}\t{}",
+                &fields[0][..fields[0].len().min(12)],
+                fields[1],
+                fields[2],
+                fields[3],
+                fields[4],
+                fields[5]
+            );
+        }
+    }
+    Ok(())
+}
+
+fn run_revoke(addr: &str, token: &str) -> Result<(), String> {
+    let device = interdriver_control_plane::net::revoke(addr, token, std::time::Duration::from_secs(5))
+        .map_err(|e| e.to_string())?;
+    println!("revoked; released device {device}");
+    Ok(())
 }
 
 fn run_issue(

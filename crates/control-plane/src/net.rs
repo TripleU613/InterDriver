@@ -109,7 +109,61 @@ fn dispatch(line: &str, broker: &Mutex<Broker>) -> String {
                 Err(error) => format!("ERR {error}"),
             }
         }
+        ["CHECK", token] => {
+            let Some(token) = Token::from_hex(token) else {
+                return "ERR bad-token".into();
+            };
+            match broker.lock() {
+                Ok(broker) => match broker.state(&token) {
+                    Some(state) => format!("OK {}", state_name(state)),
+                    None => "OK UNKNOWN".into(),
+                },
+                Err(_) => "ERR broker-poisoned".into(),
+            }
+        }
+        ["REVOKE", token] => {
+            let Some(token) = Token::from_hex(token) else {
+                return "ERR bad-token".into();
+            };
+            match broker.lock() {
+                Ok(mut broker) => match broker.revoke(&token) {
+                    Ok(device) => format!("OK {}", device.0),
+                    Err(error) => format!("ERR {error}"),
+                },
+                Err(_) => "ERR broker-poisoned".into(),
+            }
+        }
+        ["LIST"] => {
+            let mut broker = match broker.lock() {
+                Ok(broker) => broker,
+                Err(_) => return "ERR broker-poisoned".into(),
+            };
+            let mut out = String::from("OK");
+            for info in broker.sessions(now_seconds()) {
+                use std::fmt::Write as _;
+                let _ = write!(
+                    out,
+                    " {}|{}|{}|{}|{}|{}",
+                    info.token,
+                    info.device.0,
+                    info.exporter.0,
+                    info.importer.0,
+                    state_name(info.state),
+                    info.expires_at
+                );
+            }
+            out
+        }
         _ => "ERR bad-request".into(),
+    }
+}
+
+fn state_name(state: crate::SessionState) -> &'static str {
+    match state {
+        crate::SessionState::Issued => "ISSUED",
+        crate::SessionState::Active => "ACTIVE",
+        crate::SessionState::Released => "RELEASED",
+        crate::SessionState::Revoked => "REVOKED",
     }
 }
 
@@ -198,6 +252,33 @@ pub fn redeem_tls<A: ToSocketAddrs>(
     }
 }
 
+/// Operator side: current state of a session, as the broker reports it.
+pub fn check<A: ToSocketAddrs>(address: A, token_hex: &str, timeout: Duration) -> io::Result<String> {
+    let response = request(address, &format!("CHECK {token_hex}"), timeout)?;
+    response
+        .strip_prefix("OK ")
+        .map(str::to_owned)
+        .ok_or_else(|| io::Error::other(response))
+}
+
+/// Operator side: force-revoke a session by token.
+pub fn revoke<A: ToSocketAddrs>(address: A, token_hex: &str, timeout: Duration) -> io::Result<String> {
+    let response = request(address, &format!("REVOKE {token_hex}"), timeout)?;
+    response
+        .strip_prefix("OK ")
+        .map(str::to_owned)
+        .ok_or_else(|| io::Error::other(response))
+}
+
+/// Operator side: list all sessions as `token|device|exporter|importer|state|expires` rows.
+pub fn list_sessions<A: ToSocketAddrs>(address: A, timeout: Duration) -> io::Result<Vec<String>> {
+    let response = request(address, "LIST", timeout)?;
+    let body = response
+        .strip_prefix("OK")
+        .ok_or_else(|| io::Error::other(response.clone()))?;
+    Ok(body.split_whitespace().map(str::to_owned).collect())
+}
+
 /// Operator side: ask the broker to issue a ticket, returning the token hex.
 pub fn issue<A: ToSocketAddrs>(
     address: A,
@@ -265,6 +346,24 @@ mod tests {
             redeem(&addr, &token, "edge1", timeout),
             Outcome::Deny(_)
         ));
+    }
+
+    #[test]
+    fn check_revoke_list_lifecycle_over_the_wire() {
+        let (addr, _broker) = spawn_broker();
+        let t = Duration::from_secs(2);
+        let token = issue(&addr, "dev1", "edge1", "mac1", 60, t).unwrap();
+        // issued
+        assert_eq!(check(&addr, &token, t).unwrap(), "ISSUED");
+        assert!(matches!(redeem(&addr, &token, "edge1", t), Outcome::Allow));
+        assert_eq!(check(&addr, &token, t).unwrap(), "ACTIVE");
+        // list shows the active session for this device/exporter
+        let rows = list_sessions(&addr, t).unwrap();
+        assert!(rows.iter().any(|r| r.contains("dev1|edge1|mac1|ACTIVE")));
+        // revoke drops it and blocks reuse
+        assert_eq!(revoke(&addr, &token, t).unwrap(), "dev1");
+        assert_eq!(check(&addr, &token, t).unwrap(), "REVOKED");
+        assert!(matches!(redeem(&addr, &token, "edge1", t), Outcome::Deny(_)));
     }
 
     #[test]
