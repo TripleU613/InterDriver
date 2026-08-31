@@ -14,6 +14,36 @@ Conclusion: the entitlement is enforced at runtime by AMFI, not merely by the
 IOUSBHost API. Root/`sudo` does not help — AMFI is above root. A self-signed
 binary that merely claims the entitlement is killed.
 
+## Tested with root on the MacBook (2026-08-31)
+
+Root was available and used, so this is measured rather than assumed:
+
+```
+uid 0
+SIP: enabled
+nvram: WRITABLE
+bputil -d:
+  Security Mode:               Full
+  SIP Status:                  Enabled
+  Boot Args Filtering Status:  Enabled
+  Kernel CTRR Status:          Enabled
+  3rd Party Kexts Status:      Disabled
+```
+
+`nvram` accepts writes, so `boot-args=amfi_get_out_of_my_way=0x1` can be set —
+but **Boot Args Filtering is Enabled**, so Full Security discards it at boot.
+Root therefore cannot relax AMFI on this machine.
+
+Lowering Full Security to Permissive on Apple Silicon requires booting into
+Recovery by physically holding the power button; it cannot be done from a
+running system or over SSH at any privilege level. There is also no Developer ID
+in the keychain (`security find-identity` reports zero identities), so the
+provisioning-profile route cannot even be tested here.
+
+Conclusion: the importer entitlement cannot be worked around remotely. The
+options are Apple granting it, a physical Recovery-mode step on a dev Mac, or
+the gadget board.
+
 ## Two ways forward
 
 ### A. Local development / internal use — disable SIP + AMFI on a dev Mac
