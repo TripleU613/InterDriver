@@ -69,7 +69,7 @@ fn run(mut args: Vec<String>) -> Result<(), String> {
             windows_export(bus_id, port)
         }
         [platform, command, remote, bus_id] if platform == "macos" && command == "attach" => {
-            macos_attach(remote, bus_id)
+            macos_attach(remote, bus_id, ticket)
         }
         [platform, command] if platform == "macos" && command == "list" => macos_list(),
         [platform, command, bus_id] if platform == "macos" && command == "export" => {
@@ -154,7 +154,7 @@ fn print_help() {
     println!("  interdriver-usb windows export <bus-id> [port]");
     println!("  interdriver-usb macos list");
     println!("  interdriver-usb macos export <bus-id> [port]");
-    println!("  interdriver-usb macos attach <host> <bus-id>");
+    println!("  interdriver-usb macos attach <host> <bus-id> [--ticket <hex>]");
     println!("  interdriver-usb linux export <bus-id> [port] [--ticket <hex>]");
     println!("  interdriver-usb probe <host> <bus-id> [--ticket <hex>]");
     println!("  interdriver-usb linux gadget <host> <bus-id> [udc-driver udc-device]");
@@ -747,11 +747,16 @@ fn macos_export(_bus_id: &str, _port: u16) -> Result<(), String> {
 }
 
 #[cfg(target_os = "macos")]
-fn macos_attach(remote: &str, bus_id: &str) -> Result<(), String> {
-    interdriver_platform_macos::run_remote((remote, 3240), bus_id, std::time::Duration::from_secs(10))
+fn macos_attach(remote: &str, bus_id: &str, ticket: Option<[u8; 32]>) -> Result<(), String> {
+    interdriver_platform_macos::run_remote_with_ticket(
+        (remote, 3240),
+        bus_id,
+        std::time::Duration::from_secs(10),
+        ticket,
+    )
 }
 
 #[cfg(not(target_os = "macos"))]
-fn macos_attach(_remote: &str, _bus_id: &str) -> Result<(), String> {
+fn macos_attach(_remote: &str, _bus_id: &str, _ticket: Option<[u8; 32]>) -> Result<(), String> {
     Err("macOS adapter is unavailable on this platform".into())
 }

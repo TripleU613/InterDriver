@@ -74,7 +74,7 @@ INC=(
   -DKMDF_VERSION_MAJOR=1 -DKMDF_VERSION_MINOR=33 \
   -Wno-unused-command-line-argument -Wno-microsoft-anon-tag \
   "${INC[@]}" \
-  /Fo"$OUT/driver.obj" "$ROOT/driver/windows-ude/driver.c"
+  /Fo"$OUT/driver.obj" -- "$ROOT/driver/windows-ude/driver.c"
 
 "$LLD_LINK" \
   /OUT:"$OUT/interdriver-ude.sys" \
