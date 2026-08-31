@@ -71,6 +71,16 @@ fn run(mut args: Vec<String>) -> Result<(), String> {
         [platform, command, remote, bus_id] if platform == "macos" && command == "attach" => {
             macos_attach(remote, bus_id)
         }
+        [platform, command] if platform == "macos" && command == "list" => macos_list(),
+        [platform, command, bus_id] if platform == "macos" && command == "export" => {
+            macos_export(bus_id, DEFAULT_PORT)
+        }
+        [platform, command, bus_id, port] if platform == "macos" && command == "export" => {
+            let port = port
+                .parse::<u16>()
+                .map_err(|_| "port must be an integer from 1 to 65535".to_string())?;
+            macos_export(bus_id, port)
+        }
         [command, remote, bus_id] if command == "probe" => probe(remote, bus_id, ticket),
         [platform, command, remote, bus_id] if platform == "linux" && command == "gadget" => {
             linux_gadget(remote, bus_id, ticket, "dummy_udc", "dummy_udc.0")
@@ -142,6 +152,8 @@ fn print_help() {
     println!("  interdriver-usb windows attach <host> <bus-id> [--ticket <hex>]");
     println!("  interdriver-usb windows detach");
     println!("  interdriver-usb windows export <bus-id> [port]");
+    println!("  interdriver-usb macos list");
+    println!("  interdriver-usb macos export <bus-id> [port]");
     println!("  interdriver-usb macos attach <host> <bus-id>");
     println!("  interdriver-usb linux export <bus-id> [port] [--ticket <hex>]");
     println!("  interdriver-usb probe <host> <bus-id> [--ticket <hex>]");
@@ -668,6 +680,57 @@ fn windows_export(bus_id: &str, port: u16) -> Result<(), String> {
 #[cfg(not(target_os = "windows"))]
 fn windows_export(_bus_id: &str, _port: u16) -> Result<(), String> {
     Err("Windows adapter is unavailable on this platform".into())
+}
+
+#[cfg(target_os = "macos")]
+fn macos_list() -> Result<(), String> {
+    use interdriver_usbip_server::DeviceProvider as _;
+
+    let devices = interdriver_platform_macos::exporter::MacProvider::new()
+        .list()
+        .map_err(|error| error.to_string())?;
+    if devices.is_empty() {
+        println!("No Apple USB devices available for export.");
+    }
+    for description in devices {
+        println!(
+            "{}\t{:04x}:{:04x}\tinterfaces={}\tconfig={}",
+            description.device.bus_id().unwrap_or("invalid"),
+            description.device.vendor_id,
+            description.device.product_id,
+            description.interfaces.len(),
+            description.device.configuration_value
+        );
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn macos_export(bus_id: &str, port: u16) -> Result<(), String> {
+    use std::net::TcpListener;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    let provider = Arc::new(interdriver_platform_macos::exporter::MacProvider::for_device(bus_id));
+    let listener =
+        TcpListener::bind(("0.0.0.0", port)).map_err(|error| format!("bind {port}: {error}"))?;
+    let shutdown = Arc::new(AtomicBool::new(false));
+    for signal in [signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM] {
+        signal_hook::flag::register(signal, Arc::clone(&shutdown))
+            .map_err(|error| error.to_string())?;
+    }
+    eprintln!("exporting {bus_id} from IOUSBHost on port {port}; press Ctrl-C to stop");
+    interdriver_usbip_server::serve(listener, provider, shutdown).map_err(|error| error.to_string())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn macos_list() -> Result<(), String> {
+    Err("macOS adapter is unavailable on this platform".into())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn macos_export(_bus_id: &str, _port: u16) -> Result<(), String> {
+    Err("macOS adapter is unavailable on this platform".into())
 }
 
 #[cfg(target_os = "macos")]

@@ -102,6 +102,31 @@ Still to wire: transport (carry USB/IP inside mutually authenticated TLS/QUIC),
 and authenticating the operator to the broker (today the ISSUE verb is
 unauthenticated — do not expose the broker port off a trusted network).
 
+## macOS Export — WORKING end to end (proven on hardware)
+
+`interdriver-usb macos list` / `macos export <bus-id> [port]` share a locally
+attached Apple device over USB/IP. `MacProvider` implements the same
+`DeviceProvider` contract as the Linux and Windows exporters.
+
+```
+mac:   2-1  05ac:12a8  interfaces=1  config=1
+mac:   exporting 2-1 from IOUSBHost on port 3240
+linux: interdriver-usb probe 127.0.0.1 2-1
+       id 05ac:12a8   configurations 5   usb 2.00
+```
+
+Linux imported the iPhone attached to the Mac and read its real device
+descriptor; the configuration count matches `mac-device-groundtruth.md`. Device
+capture needs no entitlement and no root, unlike the importer.
+
+Two things had to be right: `IOUSBDeviceRequest` is exactly eight bytes with the
+setup-packet layout, so it is packed into one register and passed by value; and
+objc2's encoding check requires `bytes`/`mutableBytes` to be typed `*c_void`,
+not `*u8`, which otherwise panics the URB thread after a successful transfer.
+
+Remaining: endpoint traffic through `IOUSBHostPipe`; non-zero endpoints
+currently report a stall.
+
 ## macOS Export — capture and descriptors working on hardware
 
 Beyond the exclusive-ownership probe, the exporter now reads real descriptors

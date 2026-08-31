@@ -23,6 +23,8 @@ interdriver-usbip-server = { path = "../../crates/usbip-server" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 interdriver-platform-macos = { path = "../../crates/platform-macos" }
+interdriver-usbip-server = { path = "../../crates/usbip-server" }
+signal-hook = "0.3.18"
 
 [lints]
 workspace = true

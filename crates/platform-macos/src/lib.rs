@@ -5,6 +5,12 @@ mod macos;
 mod exporter_probe;
 
 #[cfg(target_os = "macos")]
+mod iokit;
+
+#[cfg(target_os = "macos")]
+pub mod exporter;
+
+#[cfg(target_os = "macos")]
 pub use exporter_probe::probe_export;
 
 #[cfg(target_os = "macos")]
