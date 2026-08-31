@@ -1,6 +1,8 @@
 use rcgen::{CertificateParams, DnType, KeyPair, KeyUsagePurpose};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use std::fs;
 use std::io;
+use std::path::Path;
 
 /// A InterDriver certificate authority. Signs peer identities; distribute only its
 /// certificate (never the key) so peers can verify each other.
@@ -83,6 +85,74 @@ impl Identity {
         }
         out
     }
+}
+
+impl Authority {
+    /// Persists the CA certificate and key as PEM (cert public, key secret).
+    pub fn save(&self, dir: &Path, name: &str) -> io::Result<()> {
+        fs::create_dir_all(dir)?;
+        fs::write(dir.join(format!("{name}-ca.pem")), self.certificate.pem())?;
+        fs::write(dir.join(format!("{name}-ca.key")), self.key.serialize_pem())?;
+        Ok(())
+    }
+}
+
+/// Loads a CA certificate (DER) from a PEM file for verifying peers.
+pub fn load_ca(path: &Path) -> io::Result<rustls::pki_types::CertificateDer<'static>> {
+    let pem = fs::read(path)?;
+    let cert = rustls_pemfile::certs(&mut pem.as_slice())
+        .next()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no certificate in CA PEM"))??;
+    Ok(cert)
+}
+
+impl Identity {
+    /// Persists this identity as a PEM chain and key.
+    pub fn save(&self, dir: &Path, name: &str) -> io::Result<()> {
+        fs::create_dir_all(dir)?;
+        fs::write(dir.join(format!("{name}.pem")), self.chain_pem())?;
+        Ok(())
+    }
+}
+
+/// Issues and immediately persists a peer identity plus its key. Returns the
+/// paths to the chain PEM and key PEM.
+impl Authority {
+    pub fn issue_to_files(
+        &self,
+        name: &str,
+        dir: &Path,
+    ) -> io::Result<(std::path::PathBuf, std::path::PathBuf)> {
+        let key = KeyPair::generate().map_err(to_io)?;
+        let mut params = CertificateParams::new(vec![name.to_owned()]).map_err(to_io)?;
+        params.distinguished_name.push(DnType::CommonName, name);
+        params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        params.use_authority_key_identifier_extension = true;
+        let leaf = params
+            .signed_by(&key, &self.certificate, &self.key)
+            .map_err(to_io)?;
+        fs::create_dir_all(dir)?;
+        let chain = format!("{}{}", leaf.pem(), self.certificate.pem());
+        let chain_path = dir.join(format!("{name}.pem"));
+        let key_path = dir.join(format!("{name}.key"));
+        fs::write(&chain_path, chain)?;
+        fs::write(&key_path, key.serialize_pem())?;
+        Ok((chain_path, key_path))
+    }
+}
+
+/// Loads an identity (cert chain + key) from PEM files on disk.
+pub fn load_identity(chain_pem: &Path, key_pem: &Path) -> io::Result<Identity> {
+    let chain_bytes = fs::read(chain_pem)?;
+    let chain: Vec<_> = rustls_pemfile::certs(&mut chain_bytes.as_slice())
+        .collect::<Result<_, _>>()?;
+    if chain.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "no certificates in chain"));
+    }
+    let key_bytes = fs::read(key_pem)?;
+    let key = rustls_pemfile::private_key(&mut key_bytes.as_slice())?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no private key in PEM"))?;
+    Ok(Identity { chain, key })
 }
 
 fn to_io<E: std::fmt::Display>(error: E) -> io::Error {

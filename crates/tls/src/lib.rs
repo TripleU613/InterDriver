@@ -11,7 +11,7 @@ mod identity;
 mod stream;
 pub mod tunnel;
 
-pub use identity::{Authority, Identity};
+pub use identity::{Authority, Identity, load_ca, load_identity};
 pub use stream::{TlsStream, accept, connect};
 pub use rustls::{ClientConfig, ServerConfig};
 

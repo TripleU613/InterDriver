@@ -132,6 +132,7 @@ dependencies = [
  "interdriver-platform-linux",
  "interdriver-platform-macos",
  "interdriver-platform-windows",
+ "interdriver-tls",
  "interdriver-usbfs-linux",
  "interdriver-usbip-client",
  "interdriver-usbip-server",

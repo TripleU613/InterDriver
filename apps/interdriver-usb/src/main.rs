@@ -99,6 +99,15 @@ fn run(mut args: Vec<String>) -> Result<(), String> {
                 .map_err(|_| "port must be an integer from 1 to 65535".to_string())?;
             linux_export(bus_id, port, ticket, broker_addr, exporter_id)
         }
+        [command, sub, dir] if command == "tls" && sub == "init" => tls_init(dir),
+        [command, sub, port, forward, dir] if command == "tls" && sub == "serve" => {
+            let port = port.parse::<u16>().map_err(|_| "bad port".to_string())?;
+            tls_serve(port, forward, dir)
+        }
+        [command, sub, port, remote, name, dir] if command == "tls" && sub == "forward" => {
+            let port = port.parse::<u16>().map_err(|_| "bad port".to_string())?;
+            tls_forward(port, remote, name, dir)
+        }
         [command, port] if command == "broker" => {
             let port = port
                 .parse::<u16>()
@@ -158,9 +167,54 @@ fn print_help() {
     println!("  interdriver-usb linux export <bus-id> [port] [--ticket <hex>]");
     println!("  interdriver-usb probe <host> <bus-id> [--ticket <hex>]");
     println!("  interdriver-usb linux gadget <host> <bus-id> [udc-driver udc-device]");
+    println!("  interdriver-usb tls init <dir>");
+    println!("  interdriver-usb tls serve <listen-port> <forward-host:port> <cert-dir>");
+    println!("  interdriver-usb tls forward <local-port> <remote-host:port> <server-name> <cert-dir>");
     println!("  interdriver-usb broker <port>");
     println!("  interdriver-usb issue <broker-addr> <device> <exporter> <importer> [ttl]");
     println!("  interdriver-usb linux export <bus-id> [port] --broker <addr> --exporter <id>");
+}
+
+fn tls_init(dir: &str) -> Result<(), String> {
+    use std::path::Path;
+    let dir = Path::new(dir);
+    let ca = interdriver_tls::Authority::generate("InterDriver USB CA").map_err(|e| e.to_string())?;
+    ca.save(dir, "interdriver").map_err(|e| e.to_string())?;
+    ca.issue_to_files("exporter", dir).map_err(|e| e.to_string())?;
+    ca.issue_to_files("importer", dir).map_err(|e| e.to_string())?;
+    println!("wrote interdriver-ca.pem, exporter.pem/.key, importer.pem/.key to {}", dir.display());
+    Ok(())
+}
+
+fn load_role(dir: &std::path::Path, role: &str) -> Result<interdriver_tls::Identity, String> {
+    interdriver_tls::load_identity(&dir.join(format!("{role}.pem")), &dir.join(format!("{role}.key")))
+        .map_err(|e| e.to_string())
+}
+
+fn tls_serve(port: u16, forward: &str, dir: &str) -> Result<(), String> {
+    use std::net::TcpListener;
+    use std::path::Path;
+    let dir = Path::new(dir);
+    let identity = load_role(dir, "exporter")?;
+    let ca = interdriver_tls::load_ca(&dir.join("interdriver-ca.pem")).map_err(|e| e.to_string())?;
+    let config = interdriver_tls::server_config(&identity, &ca).map_err(|e| e.to_string())?;
+    let listener = TcpListener::bind(("0.0.0.0", port)).map_err(|e| format!("bind {port}: {e}"))?;
+    let forward = forward.to_owned();
+    eprintln!("TLS tunnel: mTLS on :{port} -> {forward}; press Ctrl-C to stop");
+    interdriver_tls::tunnel::serve(listener, config, forward).map_err(|e| e.to_string())
+}
+
+fn tls_forward(port: u16, remote: &str, server_name: &str, dir: &str) -> Result<(), String> {
+    use std::net::TcpListener;
+    use std::path::Path;
+    let dir = Path::new(dir);
+    let identity = load_role(dir, "importer")?;
+    let ca = interdriver_tls::load_ca(&dir.join("interdriver-ca.pem")).map_err(|e| e.to_string())?;
+    let config = interdriver_tls::client_config(&identity, &ca).map_err(|e| e.to_string())?;
+    let listener = TcpListener::bind(("127.0.0.1", port)).map_err(|e| format!("bind {port}: {e}"))?;
+    let remote = remote.to_owned();
+    eprintln!("TLS tunnel: 127.0.0.1:{port} -> mTLS -> {remote}; attach/probe to 127.0.0.1:{port}");
+    interdriver_tls::tunnel::forward(listener, config, server_name.to_owned(), remote).map_err(|e| e.to_string())
 }
 
 fn run_broker(port: u16) -> Result<(), String> {
