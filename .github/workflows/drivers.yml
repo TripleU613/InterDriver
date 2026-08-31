@@ -106,11 +106,19 @@ jobs:
           nsec  = struct.unpack_from('<H', d, pe+6)[0]
           optsz = struct.unpack_from('<H', d, pe+20)[0]
           sect  = o + optsz
+          bad = []
           for i in range(nsec):
               so = sect + i*40
               name = d[so:so+8].rstrip(b'\0').decode('latin1')
               ch = struct.unpack_from('<I', d, so+36)[0]
-              assert ch & 0x40000000, f"section {name} is not readable"
+              flags = "".join(c for c, bit in
+                              (("R",0x40000000),("W",0x80000000),("X",0x20000000)) if ch & bit)
+              print(f"  section {name:12} flags={flags or '-':3} raw=0x{ch:08x}")
+              if not ch & 0x40000000:
+                  bad.append(name)
+          # An unreadable section faults the moment the kernel touches it, and
+          # lld leaves some WDK metadata sections that way unless they are merged.
+          assert not bad, f"sections not readable: {bad}"
           print(f"ok: NATIVE subsys {major}, base 0x{base:x}, checksum 0x{csum:x}, {nsec} sections all readable")
           PY
 
