@@ -553,10 +553,52 @@ fn windows_attach(remote: &str, bus_id: &str, ticket: Option<[u8; 32]>) -> Resul
         device_descriptor.len(),
         config_descriptor.len()
     );
-    println!("press Ctrl-C to detach");
+
+    // Answer the host's endpoint-0 traffic from the real device until detached.
+    let controller = ude::Controller::open_default().map_err(|error| error.to_string())?;
+    println!("serving control transfers; press Ctrl-C to detach");
     loop {
-        std::thread::sleep(Duration::from_secs(3600));
+        let urb = match controller.fetch() {
+            Ok(urb) => urb,
+            Err(error) => {
+                eprintln!("fetch failed: {error}");
+                break;
+            }
+        };
+        let device_to_host = urb.setup[0] & 0x80 != 0;
+        let length = usize::from(u16::from_le_bytes([urb.setup[6], urb.setup[7]]));
+        let mut request = if device_to_host {
+            TransferRequest::input(0, length)
+        } else {
+            TransferRequest::output(0, urb.data.clone())
+        };
+        request.setup = urb.setup;
+        let outcome = session
+            .submit(request)
+            .map_err(|error| error.to_string())
+            .and_then(|pending| {
+                pending
+                    .wait_timeout(Duration::from_secs(5))
+                    .map_err(|error| error.to_string())?
+                    .map_err(|error| error.to_string())
+            });
+        match outcome {
+            Ok(completion) if completion.status == 0 => {
+                let _ = controller.complete(urb.id, 0, &completion.data);
+            }
+            Ok(completion) => {
+                let _ = controller.complete(urb.id, completion.status, &[]);
+            }
+            Err(error) => {
+                eprintln!(
+                    "control {:#04x}/{:#04x} failed: {error}",
+                    urb.setup[0], urb.setup[1]
+                );
+                let _ = controller.complete(urb.id, -1, &[]);
+            }
+        }
     }
+    Ok(())
 }
 
 #[cfg(target_os = "windows")]

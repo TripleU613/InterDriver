@@ -34,6 +34,34 @@ typedef struct _INTERDRIVER_UDE_PLUG_IN_REQUEST {
     unsigned long ConfigDescriptorLength;
 } INTERDRIVER_UDE_PLUG_IN_REQUEST, *PINTERDRIVER_UDE_PLUG_IN_REQUEST;
 
+#define IOCTL_INTERDRIVER_UDE_FETCH_URB \
+    CTL_CODE(INTERDRIVER_UDE_DEVICE_TYPE, 0x802, METHOD_BUFFERED, FILE_READ_ACCESS)
+#define IOCTL_INTERDRIVER_UDE_COMPLETE_URB \
+    CTL_CODE(INTERDRIVER_UDE_DEVICE_TYPE, 0x803, METHOD_BUFFERED, FILE_WRITE_ACCESS)
+
 #define INTERDRIVER_UDE_MAX_DESCRIPTOR 4096
+#define INTERDRIVER_UDE_MAX_TRANSFER   65536
+#define INTERDRIVER_UDE_MAX_PENDING    32
+
+/*
+ * One endpoint-0 transfer handed up to the user-mode service. For a
+ * host-to-device request DataLength bytes of payload follow the header.
+ */
+typedef struct _INTERDRIVER_UDE_URB {
+    unsigned long Id;
+    unsigned long TransferLength;
+    unsigned long DataLength;
+    unsigned char Setup[8];
+} INTERDRIVER_UDE_URB, *PINTERDRIVER_UDE_URB;
+
+/*
+ * The answer from the real device. DataLength bytes of payload follow for a
+ * device-to-host request.
+ */
+typedef struct _INTERDRIVER_UDE_URB_RESULT {
+    unsigned long Id;
+    long Status;
+    unsigned long DataLength;
+} INTERDRIVER_UDE_URB_RESULT, *PINTERDRIVER_UDE_URB_RESULT;
 
 #endif /* INTERDRIVER_UDE_IOCTL_H */

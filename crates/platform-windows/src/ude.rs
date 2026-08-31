@@ -28,6 +28,95 @@ const fn ctl_code(function: u32) -> u32 {
 
 const IOCTL_PLUG_IN: u32 = ctl_code(0x800);
 const IOCTL_UNPLUG: u32 = ctl_code(0x801);
+/// FETCH uses FILE_READ_ACCESS, so its control code differs in the access bits.
+const IOCTL_FETCH_URB: u32 = (DEVICE_TYPE << 16) | (1 << 14) | (0x802 << 2) | METHOD_BUFFERED;
+const IOCTL_COMPLETE_URB: u32 = ctl_code(0x803);
+
+pub const MAX_TRANSFER: usize = 65536;
+
+/// One endpoint-0 transfer the driver wants answered.
+pub struct Urb {
+    pub id: u32,
+    pub transfer_length: u32,
+    pub setup: [u8; 8],
+    /// Payload for a host-to-device request; empty otherwise.
+    pub data: Vec<u8>,
+}
+
+/// A live handle on the controller, kept open across the URB pump so the
+/// driver is not reopened per transfer.
+pub struct Controller {
+    handle: Handle,
+}
+
+impl Controller {
+    pub fn open_default() -> io::Result<Self> {
+        let path = find_controller()?;
+        Ok(Self { handle: open(&path)? })
+    }
+
+    /// Blocks in the driver until a transfer is available.
+    pub fn fetch(&self) -> io::Result<Urb> {
+        let mut buffer = vec![0_u8; 16 + MAX_TRANSFER];
+        let mut returned = 0_u32;
+        let ok = unsafe {
+            DeviceIoControl(
+                self.handle.0,
+                IOCTL_FETCH_URB,
+                std::ptr::null(),
+                0,
+                buffer.as_mut_ptr().cast::<c_void>(),
+                buffer.len() as u32,
+                &mut returned,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if (returned as usize) < 20 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "short URB header"));
+        }
+        let id = u32::from_le_bytes(buffer[0..4].try_into().unwrap());
+        let transfer_length = u32::from_le_bytes(buffer[4..8].try_into().unwrap());
+        let data_length = u32::from_le_bytes(buffer[8..12].try_into().unwrap()) as usize;
+        let mut setup = [0_u8; 8];
+        setup.copy_from_slice(&buffer[12..20]);
+        let data = buffer[20..20 + data_length.min(returned as usize - 20)].to_vec();
+        Ok(Urb {
+            id,
+            transfer_length,
+            setup,
+            data,
+        })
+    }
+
+    /// Hands the device's answer back to the driver.
+    pub fn complete(&self, id: u32, status: i32, data: &[u8]) -> io::Result<()> {
+        let mut buffer = Vec::with_capacity(12 + data.len());
+        buffer.extend_from_slice(&id.to_le_bytes());
+        buffer.extend_from_slice(&status.to_le_bytes());
+        buffer.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        buffer.extend_from_slice(data);
+        let mut returned = 0_u32;
+        let ok = unsafe {
+            DeviceIoControl(
+                self.handle.0,
+                IOCTL_COMPLETE_URB,
+                buffer.as_ptr().cast::<c_void>(),
+                buffer.len() as u32,
+                std::ptr::null_mut(),
+                0,
+                &mut returned,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+}
 
 pub const SPEED_FULL: u32 = 1;
 pub const SPEED_HIGH: u32 = 2;
