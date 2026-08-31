@@ -598,12 +598,20 @@ fn windows_attach(remote: &str, bus_id: &str, ticket: Option<[u8; 32]>) -> Resul
             }
         };
         let _ = &mut request;
+        // An idle interrupt or bulk endpoint legitimately has nothing to
+        // report until the device produces data, so it gets the same budget the
+        // exporter allows rather than the short control timeout.
+        let budget = if urb.endpoint == 0 {
+            Duration::from_secs(5)
+        } else {
+            Duration::from_secs(35)
+        };
         let outcome = session
             .submit(request)
             .map_err(|error| error.to_string())
             .and_then(|pending| {
                 pending
-                    .wait_timeout(Duration::from_secs(5))
+                    .wait_timeout(budget)
                     .map_err(|error| error.to_string())?
                     .map_err(|error| error.to_string())
             });
@@ -615,10 +623,16 @@ fn windows_attach(remote: &str, bus_id: &str, ticket: Option<[u8; 32]>) -> Resul
                 let _ = controller.complete(urb.id, completion.status, &[]);
             }
             Err(error) => {
-                eprintln!(
-                    "control {:#04x}/{:#04x} failed: {error}",
-                    urb.setup[0], urb.setup[1]
-                );
+                // Endpoint zero is named by its setup packet; other endpoints
+                // by address, since their setup is zeroed.
+                if urb.endpoint == 0 {
+                    eprintln!(
+                        "control {:#04x}/{:#04x} failed: {error}",
+                        urb.setup[0], urb.setup[1]
+                    );
+                } else {
+                    eprintln!("endpoint {:#04x} failed: {error}", urb.endpoint);
+                }
                 let _ = controller.complete(urb.id, -1, &[]);
             }
         }

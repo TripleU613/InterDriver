@@ -212,7 +212,38 @@ degrade iTunes/Apple Mobile Device integration for that iPhone on that box.
 Undo with `C:\Windows\Temp\gt\restore-apple.ps1` (restores the two filters and
 cycles the device).
 
-### Windows import — a remote device now enumerates on Windows
+### Windows import — WORKING (verified on hardware 2026-08-31)
+
+A device physically attached to the Linux box now appears on Windows as a fully
+working device, through the UdeCx driver, over a reverse SSH tunnel:
+
+```
+USB Composite Device   status=OK problem=0 inf=usb.inf
+SD webcam 5160         status=OK problem=0 inf=usbvideo.inf
+USB Microphone         status=OK problem=0 inf=wdma_usb.inf
+InterDriver Virtual USB Host Controller  status=OK
+```
+
+usbccgp split the composite device into functions and Windows bound its own
+`usbvideo` and `wdma_usb` class drivers to them. No hardware, no purchased
+toolchain, no bugcheck.
+
+**The recurring bugcheck was the CFG function pointers.**
+`__guard_check_icall_fptr` and `__guard_dispatch_icall_fptr` are written by the
+kernel at load time. MSVC emits `.00cfg` read-write for that reason; lld folded
+it into read-only `.rdata`, so the kernel's own write bugchecked
+ATTEMPTED_WRITE_TO_READONLY_MEMORY every time, regardless of what else was
+fixed. `.00cfg` is now merged into `.data` and CI fails the build if either
+pointer lands in a section without the write flag.
+
+Three other real defects were fixed along the way and are worth keeping in mind
+because none of them was the recurring crash: completing URBs while holding the
+spin lock (both the teardown path and the fetch path), the endpoint-0 queue
+being parented to the emulated device so teardown freed it under a live
+pointer, and declaring only endpoint 0 so usbccgp could not start a composite
+device.
+
+### Windows import — earlier: a remote device enumerates but fails to start
 
 The UdeCx driver plugs in a device built from descriptors captured off the real
 remote device. Verified on `win-test` with the Linux webcam exported over a reverse
