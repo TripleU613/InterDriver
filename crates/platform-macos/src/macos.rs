@@ -50,16 +50,16 @@ const MESSAGE_TYPE_SETUP_TRANSFER: u32 = 0x38;
 const MESSAGE_TYPE_NORMAL_TRANSFER: u32 = 0x39;
 const MESSAGE_TYPE_STATUS_TRANSFER: u32 = 0x3a;
 const MESSAGE_TYPE_ISOCHRONOUS_TRANSFER: u32 = 0x3b;
-const MESSAGE_STATUS_SUCCESS: u32 = 1;
-const MESSAGE_STATUS_OFFLINE: u32 = 2;
-const MESSAGE_STATUS_NOT_PERMITTED: u32 = 3;
-const MESSAGE_STATUS_BAD_ARGUMENT: u32 = 4;
-const MESSAGE_STATUS_TIMEOUT: u32 = 5;
-const MESSAGE_STATUS_NO_RESOURCES: u32 = 6;
-const MESSAGE_STATUS_ENDPOINT_STOPPED: u32 = 7;
-const MESSAGE_STATUS_OVERRUN: u32 = 10;
-const MESSAGE_STATUS_STALL: u32 = 11;
-const MESSAGE_STATUS_ERROR: u32 = 13;
+const MESSAGE_STATUS_SUCCESS: i32 = 1;
+const MESSAGE_STATUS_OFFLINE: i32 = 2;
+const MESSAGE_STATUS_NOT_PERMITTED: i32 = 3;
+const MESSAGE_STATUS_BAD_ARGUMENT: i32 = 4;
+const MESSAGE_STATUS_TIMEOUT: i32 = 5;
+const MESSAGE_STATUS_NO_RESOURCES: i32 = 6;
+const MESSAGE_STATUS_ENDPOINT_STOPPED: i32 = 7;
+const MESSAGE_STATUS_OVERRUN: i32 = 10;
+const MESSAGE_STATUS_STALL: i32 = 11;
+const MESSAGE_STATUS_ERROR: i32 = 13;
 const DEVICE_SPEED_NONE: u32 = 0;
 const DEVICE_SPEED_HIGH: u32 = 3;
 const LINK_STATE_U0: u32 = 0;
@@ -177,7 +177,7 @@ impl IOUSBHostCIControllerStateMachine {
         unsafe fn respond_to_command(
             &self,
             command: *const IOUSBHostCIMessage,
-            status: u32,
+            status: i32,
             error: *mut *mut NSError,
         ) -> bool;
 
@@ -185,7 +185,7 @@ impl IOUSBHostCIControllerStateMachine {
         unsafe fn respond_to_frame_command(
             &self,
             command: *const IOUSBHostCIMessage,
-            status: u32,
+            status: i32,
             frame: u64,
             timestamp: u64,
             error: *mut *mut NSError,
@@ -206,7 +206,7 @@ impl IOUSBHostCIPortStateMachine {
         unsafe fn respond_to_command(
             &self,
             command: *const IOUSBHostCIMessage,
-            status: u32,
+            status: i32,
             error: *mut *mut NSError,
         ) -> bool;
 
@@ -219,8 +219,8 @@ impl IOUSBHostCIPortStateMachine {
         #[unsafe(method(updateLinkState:speed:inhibitLinkStateChange:error:))]
         unsafe fn update_link_state(
             &self,
-            link_state: u32,
-            speed: u32,
+            link_state: i32,
+            speed: i32,
             inhibit_link_state_change: bool,
             error: *mut *mut NSError,
         ) -> bool;
@@ -249,7 +249,7 @@ impl IOUSBHostCIDeviceStateMachine {
         unsafe fn respond_to_command(
             &self,
             command: *const IOUSBHostCIMessage,
-            status: u32,
+            status: i32,
             error: *mut *mut NSError,
         ) -> bool;
 
@@ -257,7 +257,7 @@ impl IOUSBHostCIDeviceStateMachine {
         unsafe fn respond_to_create_command(
             &self,
             command: *const IOUSBHostCIMessage,
-            status: u32,
+            status: i32,
             device_address: usize,
             error: *mut *mut NSError,
         ) -> bool;
@@ -286,7 +286,7 @@ impl IOUSBHostCIEndpointStateMachine {
         unsafe fn respond_to_command(
             &self,
             command: *const IOUSBHostCIMessage,
-            status: u32,
+            status: i32,
             error: *mut *mut NSError,
         ) -> bool;
 
@@ -297,7 +297,7 @@ impl IOUSBHostCIEndpointStateMachine {
         unsafe fn complete_transfer(
             &self,
             message: *const IOUSBHostCIMessage,
-            status: u32,
+            status: i32,
             transfer_length: usize,
             error: *mut *mut NSError,
         ) -> bool;
@@ -579,7 +579,7 @@ impl MacController {
             DEVICE_SPEED_NONE
         };
         let updated =
-            unsafe { state_machine.update_link_state(link_state, speed, false, &mut error) };
+            unsafe { state_machine.update_link_state(link_state as i32, speed as i32, false, &mut error) };
         ensure_accepted(updated, error, "root-port link update")
     }
 
@@ -1167,7 +1167,7 @@ fn transfer_request(
 fn complete_endpoint_transfer(
     state_machine: &IOUSBHostCIEndpointStateMachine,
     message: *const IOUSBHostCIMessage,
-    status: u32,
+    status: i32,
     length: usize,
 ) -> Result<(), String> {
     let mut error = std::ptr::null_mut();
@@ -1206,7 +1206,7 @@ fn usbip_speed_to_ci(speed: u32) -> u32 {
     }
 }
 
-fn usbip_status_to_ci(status: i32) -> u32 {
+fn usbip_status_to_ci(status: i32) -> i32 {
     match status {
         0 => MESSAGE_STATUS_SUCCESS,
         -32 => MESSAGE_STATUS_STALL,
