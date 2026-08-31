@@ -61,6 +61,12 @@ pub trait DeviceProvider: Send + Sync + 'static {
 /// connection before any device is touched.
 pub trait Authorizer: Send + Sync + 'static {
     fn authorize(&self, token: &[u8; TICKET_LEN]) -> bool;
+
+    /// Called once after a ticket is accepted, with a clone of the connection.
+    /// An implementation may watch the control plane and, on revocation, shut
+    /// the connection down so the exporter releases the device mid-session. The
+    /// default does nothing (a fixed ticket cannot be revoked).
+    fn watch(&self, _token: &[u8; TICKET_LEN], _connection: TcpStream) {}
 }
 
 pub fn serve(
@@ -128,6 +134,9 @@ pub fn serve_connection_authorized(
         stream.read_exact(&mut token)?;
         if !authorizer.authorize(&token) {
             return Err(invalid_data("session ticket rejected"));
+        }
+        if let Ok(connection) = stream.try_clone() {
+            authorizer.watch(&token, connection);
         }
     }
     let request = read_control_header(&mut stream)?;
@@ -462,6 +471,42 @@ mod tests {
             let _ = serve_connection(stream, provider);
         });
         (address, server)
+    }
+
+    struct RevokingAuthorizer;
+    impl Authorizer for RevokingAuthorizer {
+        fn authorize(&self, _token: &[u8; TICKET_LEN]) -> bool {
+            true
+        }
+        fn watch(&self, _token: &[u8; TICKET_LEN], connection: TcpStream) {
+            // simulate an immediate revocation: drop the live connection
+            let _ = connection.shutdown(std::net::Shutdown::Both);
+        }
+    }
+
+    #[test]
+    fn watch_can_drop_a_live_connection_after_auth() {
+        use std::io::{Read, Write};
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let provider = provider();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let _ = serve_connection_authorized(stream, provider, Some(Arc::new(RevokingAuthorizer)));
+        });
+
+        let mut client = TcpStream::connect(address).unwrap();
+        client
+            .write_all(&interdriver_usbip_protocol::TICKET_MAGIC)
+            .unwrap();
+        client.write_all(&[0_u8; TICKET_LEN]).unwrap();
+        client.flush().unwrap();
+        // the watcher shut the connection down; the server-side read hits EOF and
+        // the client sees the connection closed on its next read.
+        let mut buffer = [0_u8; 8];
+        let read = client.read(&mut buffer).unwrap_or(0);
+        assert_eq!(read, 0, "revoked connection must be dropped");
+        server.join().unwrap();
     }
 
     #[test]

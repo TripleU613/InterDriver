@@ -417,6 +417,32 @@ impl interdriver_usbip_server::Authorizer for BrokerTicket {
             }
         }
     }
+
+    /// Poll the broker; if the session stops being ACTIVE (an operator revoked
+    /// it, or it was released), shut the live connection down so the device is
+    /// freed mid-session.
+    fn watch(&self, token: &[u8; 32], connection: std::net::TcpStream) {
+        let broker = self.broker.clone();
+        let hex = interdriver_control_plane::Token::from_bytes(*token).to_hex();
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(3));
+                match interdriver_control_plane::net::check(
+                    &broker,
+                    &hex,
+                    std::time::Duration::from_secs(5),
+                ) {
+                    Ok(state) if state == "ACTIVE" || state == "ISSUED" => {}
+                    Ok(state) => {
+                        eprintln!("session {state}; dropping the connection and releasing the device");
+                        let _ = connection.shutdown(std::net::Shutdown::Both);
+                        return;
+                    }
+                    Err(_) => {}
+                }
+            }
+        });
+    }
 }
 
 #[cfg(target_os = "linux")]
