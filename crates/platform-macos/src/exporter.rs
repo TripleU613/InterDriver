@@ -22,6 +22,7 @@ const APPLE_VENDOR_ID: u16 = 0x05ac;
 const DESCRIPTOR_DEVICE: usize = 1;
 const DESCRIPTOR_CONFIGURATION: usize = 2;
 const CONTROL_TIMEOUT_SECONDS: f64 = 5.0;
+const STREAM_TIMEOUT_SECONDS: f64 = 30.0;
 const EPIPE_STATUS: i32 = -32;
 
 extern_class!(
@@ -34,6 +35,18 @@ extern_class!(
     #[unsafe(super(NSObject))]
     #[name = "NSMutableData"]
     pub struct NSMutableData;
+);
+
+extern_class!(
+    #[unsafe(super(NSObject))]
+    #[name = "IOUSBHostInterface"]
+    pub struct IOUSBHostInterface;
+);
+
+extern_class!(
+    #[unsafe(super(NSObject))]
+    #[name = "IOUSBHostPipe"]
+    pub struct IOUSBHostPipe;
 );
 
 unsafe extern "C" {
@@ -232,8 +245,39 @@ impl DeviceProvider for MacProvider {
                     "another client already owns this device",
                 )
             })?;
+            // Open every interface of the device and cache its pipes, so a
+            // bulk transfer is a map lookup rather than per-request setup.
+            let mut interfaces = Vec::new();
+            let mut pipes = std::collections::HashMap::new();
+            for child in iokit::child_interfaces(service.get()) {
+                let opened: Option<Retained<IOUSBHostInterface>> = unsafe {
+                    let mut error: *mut NSError = std::ptr::null_mut();
+                    msg_send![
+                        IOUSBHostInterface::alloc(),
+                        initWithIOService: child.get(),
+                        queue: std::ptr::null_mut::<AnyObject>(),
+                        error: &mut error,
+                        interestHandler: None::<&block2::DynBlock<dyn Fn()>>,
+                    ]
+                };
+                let Some(interface) = opened else {
+                    continue;
+                };
+                for address in endpoint_addresses(&interface) {
+                    let pipe: Option<Retained<IOUSBHostPipe>> = unsafe {
+                        let mut error: *mut NSError = std::ptr::null_mut();
+                        msg_send![&*interface, copyPipeWithAddress: address as usize, error: &mut error]
+                    };
+                    if let Some(pipe) = pipe {
+                        pipes.insert(address, pipe);
+                    }
+                }
+                interfaces.push(interface);
+            }
             return Ok(Arc::new(MacDevice {
                 device: Mutex::new(device),
+                pipes: Mutex::new(pipes),
+                _interfaces: interfaces,
             }));
         }
         Err(io::Error::new(io::ErrorKind::NotFound, "device not attached"))
@@ -242,6 +286,10 @@ impl DeviceProvider for MacProvider {
 
 struct MacDevice {
     device: Mutex<Retained<IOUSBHostDevice>>,
+    /// Endpoint address -> open pipe. Built once at open time; the interfaces
+    /// are retained so their pipes stay valid.
+    pipes: Mutex<std::collections::HashMap<u8, Retained<IOUSBHostPipe>>>,
+    _interfaces: Vec<Retained<IOUSBHostInterface>>,
 }
 
 // The framework serialises requests on the object's own queue.
@@ -319,14 +367,120 @@ impl MacDevice {
     }
 }
 
+/// Endpoint addresses declared by an interface's descriptor, direction bit
+/// included, taken from the interface itself rather than re-parsing the
+/// configuration.
+fn endpoint_addresses(interface: &IOUSBHostInterface) -> Vec<u8> {
+    type Desc = unsafe extern "C" fn(*const IOUSBHostInterface, Sel) -> *const u8;
+    let mut found = Vec::new();
+    unsafe {
+        let send: Desc = std::mem::transmute(objc_msgSend as *const c_void);
+        let descriptor = send(interface, sel!(interfaceDescriptor));
+        if descriptor.is_null() {
+            return found;
+        }
+        // bLength(0) bDescriptorType(1) bInterfaceNumber(2) bAlternateSetting(3)
+        // bNumEndpoints(4) ... then the endpoint descriptors follow in the
+        // configuration the framework hands back.
+        let count = *descriptor.add(4) as usize;
+        let mut cursor = descriptor.add(*descriptor as usize);
+        for _ in 0..count.min(16) {
+            let length = *cursor as usize;
+            if length < 2 {
+                break;
+            }
+            if *cursor.add(1) == 5 && length >= 7 {
+                found.push(*cursor.add(2));
+            }
+            cursor = cursor.add(length);
+        }
+    }
+    found
+}
+
+impl MacDevice {
+    fn stream(&self, request: &TransferRequest) -> TransferCompletion {
+        type Send = unsafe extern "C" fn(
+            *const IOUSBHostPipe,
+            Sel,
+            *mut NSMutableData,
+            *mut usize,
+            f64,
+            *mut *mut NSError,
+        ) -> bool;
+
+        let address = match request.direction {
+            Direction::In => (request.endpoint as u8) | 0x80,
+            Direction::Out => request.endpoint as u8,
+        };
+        let Ok(pipes) = self.pipes.lock() else {
+            return failed(EPIPE_STATUS);
+        };
+        let Some(pipe) = pipes.get(&address) else {
+            return failed(EPIPE_STATUS);
+        };
+        let length = if request.direction == Direction::In {
+            request.transfer_length
+        } else {
+            request.data.len()
+        };
+
+        unsafe {
+            let data: *mut NSMutableData = if length == 0 {
+                std::ptr::null_mut()
+            } else {
+                msg_send![class!(NSMutableData), dataWithLength: length]
+            };
+            if request.direction == Direction::Out && !data.is_null() {
+                let raw: *mut c_void = msg_send![&*data, mutableBytes];
+                if !raw.is_null() {
+                    std::ptr::copy_nonoverlapping(
+                        request.data.as_ptr(),
+                        raw.cast::<u8>(),
+                        length.min(request.data.len()),
+                    );
+                }
+            }
+            let send: Send = std::mem::transmute(objc_msgSend as *const c_void);
+            let mut transferred: usize = 0;
+            let mut error: *mut NSError = std::ptr::null_mut();
+            let ok = send(
+                &**pipe,
+                sel!(sendIORequestWithData:bytesTransferred:completionTimeout:error:),
+                data,
+                &mut transferred,
+                STREAM_TIMEOUT_SECONDS,
+                &mut error,
+            );
+            if !ok {
+                return failed(EPIPE_STATUS);
+            }
+            let mut out = Vec::new();
+            if request.direction == Direction::In && !data.is_null() && transferred > 0 {
+                let raw: *const c_void = msg_send![&*data, bytes];
+                if !raw.is_null() {
+                    out = std::slice::from_raw_parts(raw.cast::<u8>(), transferred.min(length))
+                        .to_vec();
+                }
+            }
+            TransferCompletion {
+                status: 0,
+                actual_length: transferred,
+                start_frame: 0,
+                error_count: 0,
+                data: out,
+                iso_packets: Vec::new(),
+            }
+        }
+    }
+}
+
 impl DeviceSession for MacDevice {
     fn submit(&self, request: TransferRequest) -> TransferCompletion {
         if request.endpoint == 0 {
             self.control(&request)
         } else {
-            // Endpoint traffic needs IOUSBHostInterface pipes, which are not
-            // wired yet; report a stall rather than pretending it succeeded.
-            failed(EPIPE_STATUS)
+            self.stream(&request)
         }
     }
 

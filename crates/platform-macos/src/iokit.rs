@@ -27,6 +27,12 @@ unsafe extern "C" {
         allocator: *const c_void,
         options: u32,
     ) -> *const c_void;
+    fn IORegistryEntryGetChildIterator(
+        entry: IoObject,
+        plane: *const c_char,
+        iterator: *mut IoObject,
+    ) -> KernReturn;
+    fn IOObjectConformsTo(object: IoObject, class_name: *const c_char) -> bool;
 }
 
 #[link(name = "CoreFoundation", kind = "framework")]
@@ -80,6 +86,37 @@ pub fn read_u32_property(service: IoObject, key: &str) -> Option<u32> {
         let ok = CFNumberGetValue(value, KCFNUMBER_SINT32, std::ptr::from_mut(&mut out).cast());
         CFRelease(value);
         if ok { Some(out as u32) } else { None }
+    }
+}
+
+/// The `IOUSBHostInterface` children of a device, in registry order. These only
+/// exist once the device is configured.
+pub fn child_interfaces(device: IoObject) -> Vec<Service> {
+    unsafe {
+        let Ok(plane) = CString::new("IOService") else {
+            return Vec::new();
+        };
+        let Ok(class_name) = CString::new("IOUSBHostInterface") else {
+            return Vec::new();
+        };
+        let mut iterator: IoObject = 0;
+        if IORegistryEntryGetChildIterator(device, plane.as_ptr(), &mut iterator) != 0 {
+            return Vec::new();
+        }
+        let mut found = Vec::new();
+        loop {
+            let child = IOIteratorNext(iterator);
+            if child == 0 {
+                break;
+            }
+            if IOObjectConformsTo(child, class_name.as_ptr()) {
+                found.push(Service(child));
+            } else {
+                IOObjectRelease(child);
+            }
+        }
+        IOObjectRelease(iterator);
+        found
     }
 }
 
