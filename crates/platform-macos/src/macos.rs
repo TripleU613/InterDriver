@@ -1090,6 +1090,15 @@ pub fn run_remote<A: ToSocketAddrs>(
     bus_id: &str,
     connect_timeout: Duration,
 ) -> Result<(), String> {
+    run_remote_with_ticket(address, bus_id, connect_timeout, None)
+}
+
+pub fn run_remote_with_ticket<A: ToSocketAddrs>(
+    address: A,
+    bus_id: &str,
+    connect_timeout: Duration,
+    ticket: Option<[u8; 32]>,
+) -> Result<(), String> {
     let remote = address
         .to_socket_addrs()
         .map_err(|error| error.to_string())?
@@ -1097,7 +1106,12 @@ pub fn run_remote<A: ToSocketAddrs>(
         .ok_or_else(|| "USB/IP host has no usable address".to_string())?;
     let mut connected_once = false;
     loop {
-        let imported = match interdriver_usbip_client::import(remote, bus_id, connect_timeout) {
+        let imported = match interdriver_usbip_client::import_with_ticket(
+            remote,
+            bus_id,
+            connect_timeout,
+            ticket,
+        ) {
             Ok(imported) => imported,
             Err(error) if connected_once => {
                 eprintln!("waiting for Apple device {bus_id} to re-enumerate: {error}");
