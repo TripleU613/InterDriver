@@ -9,6 +9,7 @@
 
 mod identity;
 mod stream;
+pub mod tunnel;
 
 pub use identity::{Authority, Identity};
 pub use stream::{TlsStream, accept, connect};

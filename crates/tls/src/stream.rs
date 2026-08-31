@@ -43,6 +43,16 @@ pub fn accept(config: Arc<rustls::ServerConfig>, tcp: TcpStream) -> io::Result<T
     })
 }
 
+impl TlsStream {
+    /// Puts the underlying socket into non-blocking mode for the duplex pump.
+    pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
+        match &self.inner {
+            Inner::Client(stream) => stream.sock.set_nonblocking(nonblocking),
+            Inner::Server(stream) => stream.sock.set_nonblocking(nonblocking),
+        }
+    }
+}
+
 impl Read for TlsStream {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         match &mut self.inner {
