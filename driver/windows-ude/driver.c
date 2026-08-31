@@ -55,6 +55,7 @@ EVT_UDECX_USB_ENDPOINT_RESET GtEvtEndpointReset;
 EVT_UDECX_USB_DEVICE_D0_ENTRY GtEvtDeviceD0Entry;
 EVT_UDECX_USB_DEVICE_D0_EXIT GtEvtDeviceD0Exit;
 EVT_WDF_IO_QUEUE_IO_INTERNAL_DEVICE_CONTROL GtEvtControlUrb;
+EVT_WDF_FILE_CLEANUP GtEvtFileCleanup;
 
 static NTSTATUS GtPlugIn(_In_ PGT_CONTROLLER Controller, _In_ PINTERDRIVER_UDE_PLUG_IN_REQUEST Request);
 static NTSTATUS GtUnplug(_In_ PGT_CONTROLLER Controller);
@@ -445,6 +446,27 @@ GtDrainPendingUrbs(
     }
 }
 
+/*
+ * The controlling user-mode process closed its handle, by exit or by crash.
+ * Nothing is left to answer endpoint traffic, so every parked URB is failed and
+ * the emulated device is removed. Without this the device stayed plugged in
+ * with requests owned by a process that no longer exists, and the next PnP
+ * teardown walked that state.
+ */
+VOID
+GtEvtFileCleanup(
+    _In_ WDFFILEOBJECT FileObject
+    )
+{
+    WDFDEVICE device = WdfFileObjectGetDevice(FileObject);
+    PGT_CONTROLLER controller = GtControllerGet(device);
+
+    GtDrainPendingUrbs(controller, STATUS_DEVICE_NOT_CONNECTED);
+    if (controller->Child != NULL) {
+        (VOID)GtUnplug(controller);
+    }
+}
+
 VOID
 GtEvtIoDeviceControl(
     _In_ WDFQUEUE Queue,
@@ -574,6 +596,7 @@ GtEvtDeviceAdd(
     WDF_OBJECT_ATTRIBUTES attributes;
     UDECX_WDF_DEVICE_CONFIG config;
     WDF_IO_QUEUE_CONFIG queueConfig;
+    WDF_FILEOBJECT_CONFIG fileConfig;
     WDFQUEUE queue;
 
     UNREFERENCED_PARAMETER(Driver);
@@ -582,6 +605,11 @@ GtEvtDeviceAdd(
     if (!NT_SUCCESS(status)) {
         return status;
     }
+
+    // Must precede WdfDeviceCreate. Cleanup runs when the last handle to the
+    // control interface goes away, which is how a dead client is noticed.
+    WDF_FILEOBJECT_CONFIG_INIT(&fileConfig, NULL, NULL, GtEvtFileCleanup);
+    WdfDeviceInitSetFileObjectConfig(DeviceInit, &fileConfig, WDF_NO_OBJECT_ATTRIBUTES);
 
     WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&attributes, GT_CONTROLLER);
 

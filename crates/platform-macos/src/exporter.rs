@@ -193,8 +193,13 @@ impl DeviceProvider for MacProvider {
                 unsafe { let _: () = msg_send![&*device, destroy]; }
                 continue;
             };
-            let configuration_value =
-                iokit::read_u32_property(service.get(), "bConfigurationValue").unwrap_or(1) as u8;
+            // IOKit publishes the active configuration as kUSBCurrentConfiguration;
+            // bConfigurationValue does not exist on the device node, and
+            // defaulting to 1 reported a PTP-only configuration for an iPhone
+            // that was actually in configuration 5, where usbmux lives.
+            let configuration_value = iokit::read_u32_property(service.get(), "kUSBCurrentConfiguration")
+                .or_else(|| iokit::read_u32_property(service.get(), "bConfigurationValue"))
+                .unwrap_or(1) as u8;
             let configuration = read_configuration(&device, configuration_value);
             unsafe { let _: () = msg_send![&*device, destroy]; }
 

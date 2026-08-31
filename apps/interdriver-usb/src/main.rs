@@ -570,6 +570,10 @@ fn windows_attach(remote: &str, bus_id: &str, ticket: Option<[u8; 32]>) -> Resul
     let controller = ude::Controller::open_default().map_err(|error| error.to_string())?;
     println!("serving control transfers; press Ctrl-C to detach");
     loop {
+        if session.is_closed() {
+            eprintln!("exporter closed the session; detaching");
+            break;
+        }
         let urb = match controller.fetch() {
             Ok(urb) => urb,
             Err(error) => {
@@ -622,6 +626,11 @@ fn windows_attach(remote: &str, bus_id: &str, ticket: Option<[u8; 32]>) -> Resul
             Ok(completion) => {
                 let _ = controller.complete(urb.id, completion.status, &[]);
             }
+            Err(error) if session.is_closed() => {
+                let _ = controller.complete(urb.id, -1, &[]);
+                eprintln!("exporter went away mid-transfer: {error}");
+                break;
+            }
             Err(error) => {
                 // Endpoint zero is named by its setup packet; other endpoints
                 // by address, since their setup is zeroed.
@@ -636,6 +645,12 @@ fn windows_attach(remote: &str, bus_id: &str, ticket: Option<[u8; 32]>) -> Resul
                 let _ = controller.complete(urb.id, -1, &[]);
             }
         }
+    }
+    // Leaving the device plugged in with nothing serving it strands the host,
+    // so the emulated device is removed on the way out. The driver also does
+    // this from its file-cleanup handler if this process dies outright.
+    if let Err(error) = ude::unplug(None) {
+        eprintln!("detach failed: {error}");
     }
     Ok(())
 }
