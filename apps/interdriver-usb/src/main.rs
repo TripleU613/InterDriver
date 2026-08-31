@@ -577,14 +577,27 @@ fn windows_attach(remote: &str, bus_id: &str, ticket: Option<[u8; 32]>) -> Resul
                 break;
             }
         };
-        let device_to_host = urb.setup[0] & 0x80 != 0;
-        let length = usize::from(u16::from_le_bytes([urb.setup[6], urb.setup[7]]));
-        let mut request = if device_to_host {
-            TransferRequest::input(0, length)
+        // Endpoint zero carries a setup packet; every other endpoint is a
+        // plain data transfer whose direction comes from the address.
+        let mut request = if urb.endpoint == 0 {
+            let device_to_host = urb.setup[0] & 0x80 != 0;
+            let length = usize::from(u16::from_le_bytes([urb.setup[6], urb.setup[7]]));
+            let mut request = if device_to_host {
+                TransferRequest::input(0, length)
+            } else {
+                TransferRequest::output(0, urb.data.clone())
+            };
+            request.setup = urb.setup;
+            request
         } else {
-            TransferRequest::output(0, urb.data.clone())
+            let number = u32::from(urb.endpoint & 0x0f);
+            if urb.endpoint & 0x80 != 0 {
+                TransferRequest::input(number, urb.transfer_length as usize)
+            } else {
+                TransferRequest::output(number, urb.data.clone())
+            }
         };
-        request.setup = urb.setup;
+        let _ = &mut request;
         let outcome = session
             .submit(request)
             .map_err(|error| error.to_string())

@@ -42,6 +42,7 @@ typedef struct _INTERDRIVER_UDE_PLUG_IN_REQUEST {
 #define INTERDRIVER_UDE_MAX_DESCRIPTOR 4096
 #define INTERDRIVER_UDE_MAX_TRANSFER   65536
 #define INTERDRIVER_UDE_MAX_PENDING    32
+#define INTERDRIVER_UDE_MAX_ENDPOINTS  16
 
 /*
  * One endpoint-0 transfer handed up to the user-mode service. For a
@@ -51,6 +52,8 @@ typedef struct _INTERDRIVER_UDE_URB {
     unsigned long Id;
     unsigned long TransferLength;
     unsigned long DataLength;
+    /* bEndpointAddress, direction bit included. 0 is the control endpoint. */
+    unsigned long EndpointAddress;
     unsigned char Setup[8];
 } INTERDRIVER_UDE_URB, *PINTERDRIVER_UDE_URB;
 

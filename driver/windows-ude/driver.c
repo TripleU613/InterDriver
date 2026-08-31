@@ -20,6 +20,7 @@
 typedef struct _GT_PENDING_URB {
     WDFREQUEST Request;
     ULONG      Id;
+    UCHAR      Address;
     BOOLEAN    InUse;
     BOOLEAN    Delivered;
 } GT_PENDING_URB, *PGT_PENDING_URB;
@@ -30,12 +31,21 @@ typedef struct _GT_CONTROLLER {
     UDECXUSBENDPOINT Control;
     WDFQUEUE         ControlQueue;
     WDFQUEUE         FetchQueue;
+    UDECXUSBENDPOINT Endpoints[INTERDRIVER_UDE_MAX_ENDPOINTS];
+    ULONG            EndpointCount;
     WDFSPINLOCK      Lock;
     GT_PENDING_URB   Pending[INTERDRIVER_UDE_MAX_PENDING];
     ULONG            NextId;
 } GT_CONTROLLER, *PGT_CONTROLLER;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(GT_CONTROLLER, GtControllerGet)
+
+typedef struct _GT_QUEUE_CONTEXT {
+    PGT_CONTROLLER Controller;
+    UCHAR          EndpointAddress;
+} GT_QUEUE_CONTEXT, *PGT_QUEUE_CONTEXT;
+
+WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(GT_QUEUE_CONTEXT, GtQueueGet)
 
 DRIVER_INITIALIZE DriverEntry;
 EVT_WDF_DRIVER_DEVICE_ADD GtEvtDeviceAdd;
@@ -96,13 +106,19 @@ GtDeliver(
         WdfRequestComplete(Fetch, status);
         return TRUE;
     }
-    status = UdecxUrbRetrieveControlSetupPacket(Slot->Request, &setup);
-    if (!NT_SUCCESS(status)) {
-        WdfRequestComplete(Fetch, status);
-        return TRUE;
+    RtlZeroMemory(&setup, sizeof(setup));
+    if (Slot->Address == 0) {
+        status = UdecxUrbRetrieveControlSetupPacket(Slot->Request, &setup);
+        if (!NT_SUCCESS(status)) {
+            WdfRequestComplete(Fetch, status);
+            return TRUE;
+        }
     }
     if (NT_SUCCESS(UdecxUrbRetrieveBuffer(Slot->Request, &buffer, &length))) {
-        if ((setup.Packet.bm.Byte & 0x80) == 0 && buffer != NULL) {
+        BOOLEAN deviceToHost = (Slot->Address == 0)
+            ? ((setup.Packet.bm.Byte & 0x80) != 0)
+            : ((Slot->Address & 0x80) != 0);
+        if (!deviceToHost && buffer != NULL) {
             payload = length;
         }
     }
@@ -114,6 +130,7 @@ GtDeliver(
     out->Id = Slot->Id;
     out->TransferLength = length;
     out->DataLength = payload;
+    out->EndpointAddress = Slot->Address;
     RtlCopyMemory(out->Setup, &setup, sizeof(out->Setup));
     if (payload != 0) {
         RtlCopyMemory(out + 1, buffer, payload);
@@ -138,7 +155,8 @@ GtEvtControlUrb(
     _In_ ULONG IoControlCode
     )
 {
-    PGT_CONTROLLER controller = GtControllerGet(WdfIoQueueGetDevice(Queue));
+    PGT_QUEUE_CONTEXT queueContext = GtQueueGet(Queue);
+    PGT_CONTROLLER controller = queueContext->Controller;
     WDFREQUEST fetch = NULL;
     PGT_PENDING_URB slot = NULL;
     ULONG index;
@@ -162,6 +180,7 @@ GtEvtControlUrb(
     slot->InUse = TRUE;
     slot->Delivered = FALSE;
     slot->Request = Request;
+    slot->Address = queueContext->EndpointAddress;
     slot->Id = ++controller->NextId;
 
     if (NT_SUCCESS(WdfIoQueueRetrieveNextRequest(controller->FetchQueue, &fetch))) {
@@ -206,6 +225,52 @@ GtEvtDeviceD0Exit(
 
 
 /*
+ * Creates one simple endpoint and the queue that serves it. Every endpoint
+ * shares GtEvtControlUrb; the queue context tells the handler which endpoint a
+ * request arrived on.
+ */
+static NTSTATUS
+GtCreateEndpoint(
+    _In_ PGT_CONTROLLER Controller,
+    _In_ UCHAR Address,
+    _Out_ UDECXUSBENDPOINT *Endpoint
+    )
+{
+    NTSTATUS status;
+    PUDECXUSBENDPOINT_INIT init;
+    UDECX_USB_ENDPOINT_CALLBACKS callbacks;
+    WDF_IO_QUEUE_CONFIG queueConfig;
+    WDF_OBJECT_ATTRIBUTES attributes;
+    WDFQUEUE queue;
+
+    WDF_IO_QUEUE_CONFIG_INIT(&queueConfig, WdfIoQueueDispatchParallel);
+    queueConfig.EvtIoInternalDeviceControl = GtEvtControlUrb;
+    WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&attributes, GT_QUEUE_CONTEXT);
+    status = WdfIoQueueCreate(Controller->Device, &queueConfig, &attributes, &queue);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+    GtQueueGet(queue)->Controller = Controller;
+    GtQueueGet(queue)->EndpointAddress = Address;
+
+    init = UdecxUsbSimpleEndpointInitAllocate(Controller->Child);
+    if (init == NULL) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    UdecxUsbEndpointInitSetEndpointAddress(init, Address);
+    UDECX_USB_ENDPOINT_CALLBACKS_INIT(&callbacks, GtEvtEndpointReset);
+    UdecxUsbEndpointInitSetCallbacks(init, &callbacks);
+
+    status = UdecxUsbEndpointCreate(&init, WDF_NO_OBJECT_ATTRIBUTES, Endpoint);
+    if (!NT_SUCCESS(status)) {
+        UdecxUsbEndpointInitFree(init);
+        return status;
+    }
+    UdecxUsbEndpointSetWdfIoQueue(*Endpoint, queue);
+    return STATUS_SUCCESS;
+}
+
+/*
  * Creates the emulated device from descriptors captured off the real device and
  * attaches it to the root port. Windows enumerates from these descriptors, so
  * the device appears without any endpoint traffic.
@@ -220,8 +285,6 @@ GtPlugIn(
     PUDECXUSBDEVICE_INIT init = NULL;
     UDECX_USB_DEVICE_STATE_CHANGE_CALLBACKS callbacks;
     UDECX_USB_DEVICE_PLUG_IN_OPTIONS options;
-    UDECX_USB_ENDPOINT_CALLBACKS endpointCallbacks;
-    PUDECXUSBENDPOINT_INIT endpointInit = NULL;
     UDECX_USB_DEVICE_SPEED speed;
     PUCHAR bytes;
 
@@ -265,22 +328,36 @@ GtPlugIn(
     }
     init = NULL;
 
-    endpointInit = UdecxUsbSimpleEndpointInitAllocate(Controller->Child);
-    if (endpointInit == NULL) {
-        status = STATUS_INSUFFICIENT_RESOURCES;
-        goto fail;
-    }
-    UdecxUsbEndpointInitSetEndpointAddress(endpointInit, USB_DEFAULT_ENDPOINT_ADDRESS);
-    UDECX_USB_ENDPOINT_CALLBACKS_INIT(&endpointCallbacks, GtEvtEndpointReset);
-    UdecxUsbEndpointInitSetCallbacks(endpointInit, &endpointCallbacks);
-
-    status = UdecxUsbEndpointCreate(&endpointInit, WDF_NO_OBJECT_ATTRIBUTES,
-                                    &Controller->Control);
+    status = GtCreateEndpoint(Controller, USB_DEFAULT_ENDPOINT_ADDRESS, &Controller->Control);
     if (!NT_SUCCESS(status)) {
         goto fail;
     }
-    endpointInit = NULL;
-    UdecxUsbEndpointSetWdfIoQueue(Controller->Control, Controller->ControlQueue);
+
+    // usbccgp cannot start a composite device whose interface endpoints do not
+    // exist, so every endpoint in the configuration is declared up front. With
+    // UdecxEndpointTypeSimple there is no later chance to add them.
+    Controller->EndpointCount = 0;
+    {
+        PUCHAR config = (PUCHAR)(Request + 1) + Request->DeviceDescriptorLength;
+        ULONG total = Request->ConfigDescriptorLength;
+        ULONG offset = 0;
+        while (offset + 2 <= total && Controller->EndpointCount < INTERDRIVER_UDE_MAX_ENDPOINTS) {
+            UCHAR length = config[offset];
+            UCHAR kind = config[offset + 1];
+            if (length < 2 || offset + length > total) {
+                break;
+            }
+            if (kind == 0x05 && length >= 7) {
+                UDECXUSBENDPOINT endpoint;
+                UCHAR address = config[offset + 2];
+                NTSTATUS created = GtCreateEndpoint(Controller, address, &endpoint);
+                if (NT_SUCCESS(created)) {
+                    Controller->Endpoints[Controller->EndpointCount++] = endpoint;
+                }
+            }
+            offset += length;
+        }
+    }
 
     UDECX_USB_DEVICE_PLUG_IN_OPTIONS_INIT(&options);
     if (speed == UdecxUsbSuperSpeed) {
@@ -296,9 +373,6 @@ GtPlugIn(
     return STATUS_SUCCESS;
 
 fail:
-    if (endpointInit != NULL) {
-        UdecxUsbEndpointInitFree(endpointInit);
-    }
     if (init != NULL) {
         UdecxUsbDeviceInitFree(init);
     }
@@ -340,6 +414,7 @@ GtUnplug(
     status = UdecxUsbDevicePlugOutAndDelete(Controller->Child);
     Controller->Child = NULL;
     Controller->Control = NULL;
+    Controller->EndpointCount = 0;
     return status;
 }
 

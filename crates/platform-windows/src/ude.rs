@@ -38,6 +38,8 @@ pub const MAX_TRANSFER: usize = 65536;
 pub struct Urb {
     pub id: u32,
     pub transfer_length: u32,
+    /// `bEndpointAddress`, direction bit included. Zero is the control endpoint.
+    pub endpoint: u8,
     pub setup: [u8; 8],
     /// Payload for a host-to-device request; empty otherwise.
     pub data: Vec<u8>,
@@ -74,18 +76,22 @@ impl Controller {
         if ok == 0 {
             return Err(io::Error::last_os_error());
         }
-        if (returned as usize) < 20 {
+        const HEADER: usize = 24;
+        if (returned as usize) < HEADER {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "short URB header"));
         }
         let id = u32::from_le_bytes(buffer[0..4].try_into().unwrap());
         let transfer_length = u32::from_le_bytes(buffer[4..8].try_into().unwrap());
         let data_length = u32::from_le_bytes(buffer[8..12].try_into().unwrap()) as usize;
+        let endpoint = u32::from_le_bytes(buffer[12..16].try_into().unwrap()) as u8;
         let mut setup = [0_u8; 8];
-        setup.copy_from_slice(&buffer[12..20]);
-        let data = buffer[20..20 + data_length.min(returned as usize - 20)].to_vec();
+        setup.copy_from_slice(&buffer[16..24]);
+        let available = (returned as usize) - HEADER;
+        let data = buffer[HEADER..HEADER + data_length.min(available)].to_vec();
         Ok(Urb {
             id,
             transfer_length,
+            endpoint,
             setup,
             data,
         })
