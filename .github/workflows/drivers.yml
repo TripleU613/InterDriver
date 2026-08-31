@@ -1,0 +1,168 @@
+name: drivers
+
+# Builds the three platform drivers and publishes one artifact each.
+#
+# Only macOS needs its own runner. The Windows kernel driver and CLI are both
+# cross-built on Linux with clang-cl/lld-link against WDK headers pulled from
+# NuGet, so no Visual Studio or WDK install is involved anywhere.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    name: linux driver
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: linux-cargo-${{ hashFiles('Cargo.lock') }}
+
+      - name: Build
+        run: cargo build --release -p interdriver-usb
+
+      - name: Test
+        run: cargo test --workspace --release
+
+      - name: Stage
+        run: |
+          mkdir -p out
+          cp target/release/interdriver-usb out/
+          cp scripts/export-device.sh scripts/attach-device.sh out/
+          cp docs/status.md out/ 2>/dev/null || true
+          ls -la out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: interdriver-usb-linux-x86_64
+          path: out/
+          if-no-files-found: error
+
+  windows:
+    name: windows driver (cross-built on linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cross toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld llvm libarchive-tools gcc-mingw-w64-x86-64
+          rustup target add x86_64-pc-windows-gnu
+
+      # The WDK unpacks to well over a gigabyte, so it is cached on the
+      # package version rather than refetched every run.
+      - name: Cache WDK
+        id: wdk
+        uses: actions/cache@v4
+        with:
+          path: .wdk
+          key: wdk-10.0.28000.2526-v1
+
+      - name: Fetch WDK headers
+        if: steps.wdk.outputs.cache-hit != 'true'
+        run: bash scripts/fetch-wdk.sh
+
+      - name: Build kernel driver
+        run: bash driver/windows-ude/build.sh
+
+      - name: Build CLI
+        run: cargo build --release -p interdriver-usb --target x86_64-pc-windows-gnu
+
+      - name: Verify the driver is a loadable kernel image
+        run: |
+          python3 - <<'PY'
+          import struct, sys
+          d = open('driver/windows-ude/build/interdriver-ude.sys','rb').read()
+          pe = struct.unpack_from('<I', d, 0x3c)[0]
+          assert d[pe:pe+4] == b'PE\0\0', "not a PE image"
+          o = pe + 24
+          base   = struct.unpack_from('<Q', d, o+24)[0]
+          salign = struct.unpack_from('<I', d, o+32)[0]
+          falign = struct.unpack_from('<I', d, o+36)[0]
+          subsys = struct.unpack_from('<H', d, o+68)[0]
+          major  = struct.unpack_from('<H', d, o+48)[0]
+          csum   = struct.unpack_from('<I', d, o+64)[0]
+          # Each of these was required to make the image load; a regression in
+          # any one of them fails the load with no useful diagnostic.
+          assert subsys == 1, f"subsystem must be NATIVE, got {subsys}"
+          assert major == 10, f"subsystem version must be 10, got {major}"
+          assert salign == 0x1000 and falign == 0x1000, "kernel images are page aligned"
+          assert csum != 0, "PE checksum must be set (/RELEASE)"
+          assert base >= 0x100000000, f"kernel image cannot prefer a user-space base 0x{base:x}"
+          nsec  = struct.unpack_from('<H', d, pe+6)[0]
+          optsz = struct.unpack_from('<H', d, pe+20)[0]
+          sect  = o + optsz
+          for i in range(nsec):
+              so = sect + i*40
+              name = d[so:so+8].rstrip(b'\0').decode('latin1')
+              ch = struct.unpack_from('<I', d, so+36)[0]
+              assert ch & 0x40000000, f"section {name} is not readable"
+          print(f"ok: NATIVE subsys {major}, base 0x{base:x}, checksum 0x{csum:x}, {nsec} sections all readable")
+          PY
+
+      - name: Stage
+        run: |
+          mkdir -p out
+          cp driver/windows-ude/build/interdriver-ude.sys out/
+          cp driver/windows-ude/interdriver-ude.inf out/
+          cp driver/windows-ude/README.md out/DRIVER-README.md
+          cp target/x86_64-pc-windows-gnu/release/interdriver-usb.exe out/
+          cp driver/windows-ude/package.sh out/
+          ls -la out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: interdriver-usb-windows-x86_64
+          path: out/
+          if-no-files-found: error
+
+  macos:
+    name: macos driver
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: macos-cargo-${{ hashFiles('Cargo.lock') }}
+
+      - name: Build
+        run: cargo build --release -p interdriver-usb
+
+      - name: Build probes
+        run: cargo build --release -p interdriver-platform-macos
+
+      - name: Stage
+        run: |
+          mkdir -p out
+          cp target/release/interdriver-usb out/
+          cp target/release/interdriver-macos-export-probe out/ 2>/dev/null || true
+          cp target/release/interdriver-macos-controller-probe out/ 2>/dev/null || true
+          cp crates/platform-macos/entitlements.plist out/
+          cp docs/apple-entitlement-request.md out/ 2>/dev/null || true
+          ls -la out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: interdriver-usb-macos-arm64
+          path: out/
+          if-no-files-found: error
