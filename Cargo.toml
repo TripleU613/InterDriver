@@ -12,6 +12,7 @@ members = [
     "crates/usbfs-linux",
     "crates/control-plane",
     "crates/gadget-linux",
+    "crates/tls",
 ]
 resolver = "3"
 

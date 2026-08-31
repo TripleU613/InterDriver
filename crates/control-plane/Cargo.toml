@@ -4,5 +4,8 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
+[dependencies]
+interdriver-tls = { path = "../tls" }
+
 [lints]
 workspace = true

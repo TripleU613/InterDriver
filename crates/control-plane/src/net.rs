@@ -10,7 +10,8 @@
 //! wraps this in mutually authenticated TLS. Do not expose it unauthenticated.
 
 use crate::{Broker, DeviceKey, PeerId, Token};
-use std::io::{self, BufRead, BufReader, Write};
+use std::sync::Arc as StdArc;
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -37,14 +38,40 @@ pub fn serve(listener: TcpListener, broker: Arc<Mutex<Broker>>) -> io::Result<()
 
 fn handle(stream: TcpStream, broker: &Mutex<Broker>) -> io::Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
-    let mut reader = BufReader::new(stream.try_clone()?);
+    handle_stream(stream, broker)
+}
+
+/// One request line in, one response line out, over any byte stream (plain TCP
+/// or a mutually authenticated TLS stream).
+fn handle_stream<S: Read + Write>(mut stream: S, broker: &Mutex<Broker>) -> io::Result<()> {
+    let mut reader = BufReader::new(&mut stream);
     let mut line = String::new();
     reader.read_line(&mut line)?;
     let response = dispatch(line.trim(), broker);
-    let mut stream = stream;
     stream.write_all(response.as_bytes())?;
     stream.write_all(b"\n")?;
     stream.flush()
+}
+
+/// Serves the broker over mutually authenticated TLS: every ISSUE/REDEEM peer
+/// must present a certificate signed by the shared InterDriver CA.
+pub fn serve_tls(
+    listener: TcpListener,
+    broker: Arc<Mutex<Broker>>,
+    server_config: StdArc<interdriver_tls::ServerConfig>,
+) -> io::Result<()> {
+    for stream in listener.incoming() {
+        let stream = stream?;
+        let broker = Arc::clone(&broker);
+        let server_config = StdArc::clone(&server_config);
+        std::thread::spawn(move || {
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+            if let Ok(tls) = interdriver_tls::accept(server_config, stream) {
+                let _ = handle_stream(tls, &broker);
+            }
+        });
+    }
+    Ok(())
 }
 
 fn dispatch(line: &str, broker: &Mutex<Broker>) -> String {
@@ -94,21 +121,81 @@ pub enum Outcome {
     Unreachable(io::Error),
 }
 
-fn request<A: ToSocketAddrs>(address: A, line: &str, timeout: Duration) -> io::Result<String> {
+fn connect_tcp<A: ToSocketAddrs>(address: A, timeout: Duration) -> io::Result<TcpStream> {
     let address = address
         .to_socket_addrs()?
         .next()
         .ok_or_else(|| io::Error::new(io::ErrorKind::AddrNotAvailable, "no broker address"))?;
-    let mut stream = TcpStream::connect_timeout(&address, timeout)?;
+    let stream = TcpStream::connect_timeout(&address, timeout)?;
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
+    Ok(stream)
+}
+
+fn exchange<S: Read + Write>(mut stream: S, line: &str) -> io::Result<String> {
     stream.write_all(line.as_bytes())?;
     stream.write_all(b"\n")?;
     stream.flush()?;
-    let mut reader = BufReader::new(stream);
+    let mut reader = BufReader::new(&mut stream);
     let mut response = String::new();
     reader.read_line(&mut response)?;
     Ok(response.trim().to_owned())
+}
+
+fn request<A: ToSocketAddrs>(address: A, line: &str, timeout: Duration) -> io::Result<String> {
+    exchange(connect_tcp(address, timeout)?, line)
+}
+
+fn request_tls<A: ToSocketAddrs>(
+    address: A,
+    server_name: &str,
+    client_config: StdArc<interdriver_tls::ClientConfig>,
+    line: &str,
+    timeout: Duration,
+) -> io::Result<String> {
+    let tcp = connect_tcp(address, timeout)?;
+    let tls = interdriver_tls::connect(client_config, server_name, tcp)?;
+    exchange(tls, line)
+}
+
+/// Operator side over mTLS.
+pub fn issue_tls<A: ToSocketAddrs>(
+    address: A,
+    server_name: &str,
+    client_config: StdArc<interdriver_tls::ClientConfig>,
+    device: &str,
+    exporter: &str,
+    importer: &str,
+    ttl: u64,
+    timeout: Duration,
+) -> io::Result<String> {
+    let line = format!("ISSUE {device} {exporter} {importer} {ttl}");
+    let response = request_tls(address, server_name, client_config, &line, timeout)?;
+    match response.strip_prefix("OK ") {
+        Some(rest) => rest
+            .split_whitespace()
+            .next()
+            .map(str::to_owned)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "malformed OK")),
+        None => Err(io::Error::other(response)),
+    }
+}
+
+/// Exporter side over mTLS.
+pub fn redeem_tls<A: ToSocketAddrs>(
+    address: A,
+    server_name: &str,
+    client_config: StdArc<interdriver_tls::ClientConfig>,
+    token_hex: &str,
+    exporter: &str,
+    timeout: Duration,
+) -> Outcome {
+    let line = format!("REDEEM {token_hex} {exporter}");
+    match request_tls(address, server_name, client_config, &line, timeout) {
+        Ok(response) if response.starts_with("OK") => Outcome::Allow,
+        Ok(response) => Outcome::Deny(response),
+        Err(error) => Outcome::Unreachable(error),
+    }
 }
 
 /// Operator side: ask the broker to issue a ticket, returning the token hex.
@@ -198,6 +285,39 @@ mod tests {
         let token = issue(&addr, "dev1", "edge1", "mac1", 60, timeout).unwrap();
         assert!(matches!(
             redeem(&addr, &token, "attacker", timeout),
+            Outcome::Deny(_)
+        ));
+    }
+
+    #[test]
+    fn mtls_broker_issue_then_redeem_over_the_wire() {
+        use interdriver_tls::Authority;
+        let ca = Authority::generate("InterDriver CA").unwrap();
+        let server_id = ca.issue("broker").unwrap();
+        let operator = ca.issue("operator").unwrap();
+        let ca_cert = ca.certificate();
+
+        let server_cfg = interdriver_tls::server_config(&server_id, &ca_cert).unwrap();
+        let client_cfg = interdriver_tls::client_config(&operator, &ca_cert).unwrap();
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let broker = Arc::new(Mutex::new(Broker::new()));
+        let served = Arc::clone(&broker);
+        std::thread::spawn(move || {
+            let _ = serve_tls(listener, served, server_cfg);
+        });
+
+        let timeout = Duration::from_secs(3);
+        let token = issue_tls(&addr, "broker", StdArc::clone(&client_cfg), "dev1", "edge1", "mac1", 60, timeout).unwrap();
+        assert_eq!(token.len(), 64);
+        assert!(matches!(
+            redeem_tls(&addr, "broker", StdArc::clone(&client_cfg), &token, "edge1", timeout),
+            Outcome::Allow
+        ));
+        // single-use holds over mTLS too
+        assert!(matches!(
+            redeem_tls(&addr, "broker", client_cfg, &token, "edge1", timeout),
             Outcome::Deny(_)
         ));
     }
