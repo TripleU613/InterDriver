@@ -87,7 +87,7 @@ GtEvtQueryUsbCapability(
  * Fills a waiting user-mode fetch request from a pending URB. Caller holds the
  * lock. Returns TRUE if the fetch was completed.
  */
-static BOOLEAN
+static NTSTATUS
 GtDeliver(
     _In_ PGT_CONTROLLER Controller,
     _In_ PGT_PENDING_URB Slot,
@@ -104,15 +104,13 @@ GtDeliver(
 
     status = WdfRequestRetrieveOutputBuffer(Fetch, sizeof(*out), (PVOID *)&out, &outLength);
     if (!NT_SUCCESS(status)) {
-        WdfRequestComplete(Fetch, status);
-        return TRUE;
+        return status;
     }
     RtlZeroMemory(&setup, sizeof(setup));
     if (Slot->Address == 0) {
         status = UdecxUrbRetrieveControlSetupPacket(Slot->Request, &setup);
         if (!NT_SUCCESS(status)) {
-            WdfRequestComplete(Fetch, status);
-            return TRUE;
+            return status;
         }
     }
     if (NT_SUCCESS(UdecxUrbRetrieveBuffer(Slot->Request, &buffer, &length))) {
@@ -123,9 +121,8 @@ GtDeliver(
             payload = length;
         }
     }
-    if (outLength < sizeof(*out) + payload) {
-        WdfRequestComplete(Fetch, STATUS_BUFFER_TOO_SMALL);
-        return TRUE;
+    if (payload > outLength - sizeof(*out)) {
+        return STATUS_BUFFER_TOO_SMALL;
     }
 
     out->Id = Slot->Id;
@@ -138,9 +135,8 @@ GtDeliver(
     }
     Slot->Delivered = TRUE;
     WdfRequestSetInformation(Fetch, sizeof(*out) + payload);
-    WdfRequestComplete(Fetch, STATUS_SUCCESS);
     UNREFERENCED_PARAMETER(Controller);
-    return TRUE;
+    return STATUS_SUCCESS;
 }
 
 /*
@@ -160,6 +156,7 @@ GtEvtControlUrb(
     PGT_CONTROLLER controller = queueContext->Controller;
     WDFREQUEST fetch = NULL;
     PGT_PENDING_URB slot = NULL;
+    NTSTATUS deliverStatus = STATUS_SUCCESS;
     ULONG index;
 
     UNREFERENCED_PARAMETER(OutputBufferLength);
@@ -185,9 +182,17 @@ GtEvtControlUrb(
     slot->Id = ++controller->NextId;
 
     if (NT_SUCCESS(WdfIoQueueRetrieveNextRequest(controller->FetchQueue, &fetch))) {
-        GtDeliver(controller, slot, fetch);
+        deliverStatus = GtDeliver(controller, slot, fetch);
+    } else {
+        fetch = NULL;
     }
     WdfSpinLockRelease(controller->Lock);
+
+    // Completed outside the lock: UdeCx and the framework can run teardown
+    // synchronously from a completion, which must not re-enter this lock.
+    if (fetch != NULL) {
+        WdfRequestComplete(fetch, deliverStatus);
+    }
 }
 
 VOID
@@ -489,8 +494,9 @@ GtEvtIoDeviceControl(
             }
         }
         if (slot != NULL) {
-            GtDeliver(controller, slot, Request);
+            NTSTATUS deliver = GtDeliver(controller, slot, Request);
             WdfSpinLockRelease(controller->Lock);
+            WdfRequestComplete(Request, deliver);
             return;
         }
         /* Nothing waiting: park the fetch until a URB arrives. */
