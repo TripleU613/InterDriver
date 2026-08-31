@@ -87,6 +87,7 @@ INC=(
   /MERGE:_guard_dispatch_icall_=.data \
   /MERGE:memset_=.data \
   /MERGE:.retplne=.data \
+  /MERGE:.00cfg=.data \
   /LIBPATH:"$WDK/Lib/$SDKVER/km/x64" \
   /LIBPATH:"$WDK/Lib/$SDKVER/km/x64/ude/1.0" \
   /LIBPATH:"$WDK/Lib/wdf/kmdf/x64/$KMDF" \

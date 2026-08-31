@@ -119,6 +119,34 @@ jobs:
           # An unreadable section faults the moment the kernel touches it, and
           # lld leaves some WDK metadata sections that way unless they are merged.
           assert not bad, f"sections not readable: {bad}"
+
+          # The kernel writes the Control Flow Guard function pointers at load
+          # time. MSVC emits .00cfg read-write for that reason; lld folds it into
+          # read-only .rdata, which bugchecks ATTEMPTED_WRITE_TO_READONLY_MEMORY
+          # on every load. Verify they landed somewhere writable.
+          import re
+          secs = []
+          for i in range(nsec):
+              so = sect + i*40
+              nm = d[so:so+8].rstrip(b'\0').decode('latin1')
+              vs, va = struct.unpack_from('<II', d, so+8)
+              ch = struct.unpack_from('<I', d, so+36)[0]
+              secs.append((nm, va, max(vs,1), ch))
+          imgbase = struct.unpack_from('<Q', d, o+24)[0]
+          checked = 0
+          for line in open('driver/windows-ude/build/interdriver-ude.map', errors='ignore'):
+              m = re.search(r'(__guard_(?:check|dispatch)_icall_fptr)\s+([0-9a-fA-F]{16})', line)
+              if not m:
+                  continue
+              rva = int(m.group(2), 16) - imgbase
+              owner = next((x for x in secs if x[1] <= rva < x[1]+x[2]), None)
+              assert owner, f"{m.group(1)} rva 0x{rva:x} is in no section"
+              assert owner[3] & 0x80000000, (
+                  f"{m.group(1)} is in read-only section {owner[0]}; "
+                  "merge .00cfg into .data")
+              checked += 1
+              print(f"  {m.group(1)} in {owner[0]} (writable)")
+          assert checked >= 2, f"expected both CFG pointers, found {checked}"
           print(f"ok: NATIVE subsys {major}, base 0x{base:x}, checksum 0x{csum:x}, {nsec} sections all readable")
           PY
 
