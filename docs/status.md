@@ -329,7 +329,23 @@ are signed int32; the doorbell is unsigned uint32) — commit 298a3ee.
 of control-endpoint transfers complete successfully (device descriptor, every
 configuration descriptor, string descriptors, status stages).
 
-**Root cause pinned to one USB request (2026-08-31 follow-up):** the failing
+**Fully diagnosed (2026-08-31, deeper pass):** the endpoint is in state
+Paused (endpointState == 2) at the moment the 0x45 completion arrives — the
+kernel pauses the control endpoint as part of its own sequence and treats it as
+Paused the instant it sends the EndpointPause command, before the client can
+respond. So the successful 4-byte answer cannot be delivered
+(enqueueTransferCompletionForMessage rejects a completion on a Paused endpoint),
+and the transfer must be re-issued after the kernel resumes the endpoint.
+Network latency is NOT the cause (Mac<->exporter is direct, ~5 ms round trip).
+Codex's controller defers the pause and unlinks the in-flight transfer, then
+crashes on the rejected completion. Tolerating the rejection stops the crash but
+the device tears down because the re-issued 0x45 is not completed while the
+endpoint is Active. **The fix is a pause/resume-ordering rework in the endpoint
+state machine:** hold or re-drive the transfer so the re-issued 0x45 completes
+during an Active window, and report ENDPOINT_STOPPED for the superseded attempt.
+This is controller-internals work best done by the controller author.
+
+**Root cause pinned to one USB request (earlier pass):** the failing
 control transfer is Apple vendor request `bmRequestType=0xc0 bRequest=0x45`
 (device->host, 4 bytes), sent right after macOS reads the configuration
 descriptors and before any SET_CONFIGURATION. The remote answers it correctly
