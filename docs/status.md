@@ -433,3 +433,28 @@ kernel. Either complete it during the Active window before the kernel pauses
 accepts, or handle the DATA->pause->STATUS control-transfer sequencing so the
 kernel advances past 0x45 instead of re-issuing. This is intricate IOUSBHostCI
 control-transfer state-machine work.
+
+## macOS import — three theories eliminated on hardware (2026-09-01)
+
+Continued directly (full latitude). Instrumented the completion path and tested
+three independent fixes end-to-end:
+
+1. Tolerate/drop the paused completion — device tears down (tried earlier).
+2. Stop unlinking the in-flight transfer when a pause is deferred — KEPT: this is
+   a real improvement. The 0x45 completion now arrives Ok with the endpoint
+   Active (epstate==3) instead of Paused-and-dropped. Confirmed via RESULT trace:
+   `RESULT ep0 ok len=4 status=0 epstate=3`.
+3. interruptRateHz 1000 -> 0 (deliver interrupts to the kernel immediately) —
+   no change.
+
+Despite the completion now landing Ok on an Active endpoint, the kernel/framework
+still logs "Failed to send interrupts to kernel" (x3) and tears the controller
+down; cfgutil never lists the device. The wall is now in the
+IOUSBHostControllerInterface interrupt-DELIVERY path to the kernel, not in our
+completion logic, the unlink, or the interrupt rate. This needs kernel/IOKit-side
+visibility (or Apple) to go further; it is not solvable by more edits to the
+user-space controller's completion handling from here.
+
+State on this branch: 0x45 no longer crashes and its completion reaches our code
+Ok+Active. Remaining blocker: framework interrupt delivery. macOS import is the
+only non-working cell; the gadget-mode importer remains the hardware hedge.

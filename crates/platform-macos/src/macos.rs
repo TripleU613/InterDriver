@@ -1,8 +1,6 @@
 use block2::{DynBlock, RcBlock};
 use interdriver_usbip_protocol::{Direction, IsoPacketDescriptor};
-use interdriver_usbip_session::{
-    Error as SessionError, Session, TransferCompletion, TransferError, TransferRequest,
-};
+use interdriver_usbip_session::{Session, TransferCompletion, TransferError, TransferRequest};
 use objc2::rc::{Allocated, Retained, autoreleasepool};
 use objc2::runtime::{AnyObject, NSObject};
 use objc2::{AnyThread, Encode, Encoding, RefEncode, extern_class, extern_methods};
@@ -718,20 +716,12 @@ impl MacController {
                 ));
             }
             endpoint.deferred_command = Some(command);
-            if let Some(session) = &self.session {
-                match session.unlink(sequence) {
-                    Ok(unlink) => {
-                        thread::Builder::new()
-                            .name("interdriver-usbip-unlink".into())
-                            .spawn(move || {
-                                let _ = unlink.wait_timeout(Duration::from_secs(5));
-                            })
-                            .map_err(|error| error.to_string())?;
-                    }
-                    Err(SessionError::InvalidRequest("target transfer is not pending")) => {}
-                    Err(error) => return Err(error.to_string()),
-                }
-            }
+            // Do NOT unlink the in-flight transfer here. Cancelling it races the
+            // remote answer: if the unlink wins, the completion arrives Cancelled,
+            // the kernel never gets the result, re-issues, and ep0 loops forever.
+            // Let the transfer finish naturally so its answer can be delivered
+            // before the deferred pause is honored.
+            let _ = sequence;
             return Ok(());
         }
         self.respond_endpoint_command(key, command)?;
