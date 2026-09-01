@@ -293,17 +293,20 @@ impl UsbfsDevice {
         };
         let mut buffer = make_buffer();
         let mut outcome = ioctl::bulk(self.fd.as_fd(), endpoint, &mut buffer, TRANSFER_TIMEOUT_MS);
+        // A quiet IN pipe is neither an error nor a zero-length packet. Failing it
+        // halts the endpoint on the importing host; answering it with a fabricated
+        // ZLP is worse, because protocols like the restore transport read meaning
+        // into an empty packet. usbfs transfers are synchronous, so re-arm the read
+        // instead -- that is what a real controller does by leaving the URB queued.
+        // A device that goes away fails the ioctl with ENODEV and ends the loop.
+        while request.direction == Direction::In
+            && matches!(outcome, Outcome::Failed(status) if status == TIMEOUT_STATUS)
+            && !self.disconnected()
+        {
+            outcome = ioctl::bulk(self.fd.as_fd(), endpoint, &mut buffer, TRANSFER_TIMEOUT_MS);
+        }
         if is_device_gone(&outcome) {
             self.gone.store(true, Ordering::Release);
-        }
-        // An IN pipe that stayed quiet is not a device error: usbfs transfers are
-        // synchronous, so we give up where a real controller would leave the URB
-        // queued. Retire it empty. Reporting a failure instead halts the endpoint
-        // on the importing host, which kills an idle usbmux pipe mid-session.
-        if request.direction == Direction::In
-            && matches!(outcome, Outcome::Failed(status) if status == TIMEOUT_STATUS)
-        {
-            outcome = Outcome::Transferred(0);
         }
         completion(outcome, buffer, request.direction)
     }
@@ -507,11 +510,13 @@ mod timeout_tests {
     use super::*;
 
     #[test]
-    fn quiet_in_pipe_retires_empty_but_real_failures_still_fail() {
+    fn a_quiet_in_read_is_re_armed_while_a_real_failure_is_reported() {
         let quiet = Outcome::Failed(TIMEOUT_STATUS);
         let stalled = Outcome::Failed(EPIPE_STATUS);
-        let retire = |o: &Outcome| matches!(o, Outcome::Failed(s) if *s == TIMEOUT_STATUS);
-        assert!(retire(&quiet), "an idle IN read must not be reported as a failure");
-        assert!(!retire(&stalled), "a stall must still surface as a failure");
+        let gone = Outcome::Failed(ENODEV_STATUS);
+        let re_arm = |o: &Outcome| matches!(o, Outcome::Failed(s) if *s == TIMEOUT_STATUS);
+        assert!(re_arm(&quiet), "a quiet IN read must be re-armed, never answered with a ZLP");
+        assert!(!re_arm(&stalled), "a stall must surface as a failure");
+        assert!(!re_arm(&gone), "a departed device must surface, not spin");
     }
 }
