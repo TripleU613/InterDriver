@@ -17,9 +17,28 @@ const MESSAGE_TYPE_CONTROLLER_CAPABILITIES: u32 = 0x00;
 const MESSAGE_TYPE_PORT_CAPABILITIES: u32 = 0x01;
 const MESSAGE_CONTROL_NO_RESPONSE: u32 = 1 << 14;
 const MESSAGE_CONTROL_VALID: u32 = 1 << 15;
+fn trace_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("INTERDRIVER_TRACE").is_some())
+}
+
+macro_rules! trace {
+    ($($arg:tt)*) => {
+        if crate::macos::trace_enabled() {
+            eprintln!($($arg)*);
+        }
+    };
+}
+
 const CAPABILITIES_PORT_COUNT_PHASE: u32 = 16;
 const CAPABILITIES_TIMEOUT_PHASE: u32 = 0;
 const CAPABILITIES_LATENCY_PHASE: u32 = 4;
+// data0[0:1], 2^n seconds. Ceiling for a command round trip; exceeding it is fatal.
+const COMMAND_TIMEOUT_THRESHOLD: u32 = 3;
+// data0[4:7], 2^n milliseconds. Apple: "time needed to pass a transfer structure
+// and its associated data payload between the interface and its target." Our target
+// is a USB device on the far side of a TCP tunnel, so 2^8 = 256ms, not a local 4ms.
+const CONNECTION_LATENCY: u32 = 8;
 const PORT_CAPABILITIES_PORT_NUMBER_PHASE: u32 = 16;
 const PORT_CAPABILITIES_MAX_POWER_PHASE: u32 = 0;
 const MESSAGE_TYPE_MASK: u32 = 0x3f;
@@ -56,7 +75,6 @@ const MESSAGE_STATUS_NOT_PERMITTED: i32 = 3;
 const MESSAGE_STATUS_BAD_ARGUMENT: i32 = 4;
 const MESSAGE_STATUS_TIMEOUT: i32 = 5;
 const MESSAGE_STATUS_NO_RESOURCES: i32 = 6;
-const MESSAGE_STATUS_ENDPOINT_STOPPED: i32 = 7;
 const MESSAGE_STATUS_OVERRUN: i32 = 10;
 const MESSAGE_STATUS_STALL: i32 = 11;
 const MESSAGE_STATUS_ERROR: i32 = 13;
@@ -466,6 +484,8 @@ impl MacController {
 
     fn handle_command(&mut self, command: IOUSBHostCIMessage) -> Result<(), String> {
         let message_type = command.control & MESSAGE_TYPE_MASK;
+        let cd0 = command.data0;
+        trace!("CMD {:#04x} d0={:#010x}", message_type, cd0);
         match message_type {
             MESSAGE_TYPE_CONTROLLER_POWER_ON
             | MESSAGE_TYPE_CONTROLLER_POWER_OFF
@@ -534,6 +554,8 @@ impl MacController {
         ensure_accepted(accepted, error, "root-port command inspection")?;
 
         let message_type = command.control & MESSAGE_TYPE_MASK;
+        let cd0 = command.data0;
+        trace!("CMD {:#04x} d0={:#010x}", message_type, cd0);
         match message_type {
             MESSAGE_TYPE_PORT_POWER_ON => {
                 state_machine.set_powered(true);
@@ -747,6 +769,9 @@ impl MacController {
                 .respond_to_command(&command, MESSAGE_STATUS_SUCCESS, &mut error)
         };
         ensure_accepted(responded, error, "endpoint command response")?;
+        if let Some(ep) = self.endpoints.get(&key) {
+            trace!("  -> after cmd {:#04x}: epstate={}", command.control & MESSAGE_TYPE_MASK, ep.state_machine.endpoint_state());
+        }
         if destroy {
             self.endpoints.remove(&key);
         }
@@ -759,14 +784,18 @@ impl MacController {
             endpoint: ((doorbell >> 8) & 0xff) as u8,
         };
         let Some(endpoint) = self.endpoints.get(&key) else {
+            trace!("DOORBELL {doorbell:#010x} -> NO ENDPOINT dev={} ep={:#04x}", key.device, key.endpoint);
             return Ok(());
         };
+        let before = endpoint.state_machine.endpoint_state();
         let mut error = std::ptr::null_mut();
         let accepted = unsafe {
             endpoint
                 .state_machine
                 .process_doorbell(doorbell, &mut error)
         };
+        let after = endpoint.state_machine.endpoint_state();
+        trace!("DOORBELL {doorbell:#010x} ep={:#04x} accepted={accepted} state {before}->{after}", key.endpoint);
         ensure_accepted(accepted, error, "endpoint doorbell")?;
         self.drive_endpoint(key)
     }
@@ -787,6 +816,7 @@ impl MacController {
     ) -> Result<(), String> {
         while endpoint.pending_sequence.is_none() {
             if endpoint.state_machine.endpoint_state() != ENDPOINT_STATE_ACTIVE {
+                trace!("  drive_endpoint BAIL: ep{:#04x} state={}", key.endpoint, endpoint.state_machine.endpoint_state());
                 return Ok(());
             }
             let pointer = endpoint.state_machine.current_transfer_message();
@@ -1013,15 +1043,19 @@ impl MacController {
             return Ok(());
         };
         endpoint.pending_sequence = None;
+        if key.endpoint & 0x0f == 0 {
+            let sp = endpoint.setup.unwrap_or([0;8]);
+            match &result {
+                Ok(c) => trace!("FIN ep0 req={:02x?} data={:02x?} len={}", sp, &c.data[..c.data.len().min(8)], c.actual_length),
+                Err(e) => trace!("FIN ep0 req={:02x?} ERR {e:?}", sp),
+            }
+        }
 
-        let stopped = endpoint
-            .deferred_command
-            .as_ref()
-            .is_some_and(endpoint_command_stops_transfer);
-        let inactive = endpoint.state_machine.endpoint_state() != ENDPOINT_STATE_ACTIVE;
+        // A deferred pause does not cancel the in-flight transfer, so by the time we
+        // get here the remote answer is real. EndpointStopped is only for a transfer
+        // that generated an event *instead of* completing; reporting it for a genuine
+        // completion makes the kernel discard the data and re-issue the same request.
         let (status, actual_length) = match result {
-            _ if inactive => (MESSAGE_STATUS_ENDPOINT_STOPPED, 0),
-            _ if stopped => (MESSAGE_STATUS_ENDPOINT_STOPPED, 0),
             Ok(completion) => {
                 if completion.actual_length > requested_length {
                     return Err(format!(
@@ -1182,7 +1216,9 @@ fn complete_endpoint_transfer(
     status: i32,
     length: usize,
 ) -> Result<(), String> {
-    if state_machine.endpoint_state() != ENDPOINT_STATE_ACTIVE {
+    let state = state_machine.endpoint_state();
+    if state != ENDPOINT_STATE_ACTIVE {
+        trace!("  COMPLETION DROPPED: state={state} status={status} len={length}");
         return Ok(());
     }
     let mut error = std::ptr::null_mut();
@@ -1194,13 +1230,6 @@ fn complete_endpoint_transfer(
         return Ok(());
     }
     ensure_accepted(completed, error, "endpoint transfer completion")
-}
-
-fn endpoint_command_stops_transfer(command: &IOUSBHostCIMessage) -> bool {
-    matches!(
-        command.control & MESSAGE_TYPE_MASK,
-        MESSAGE_TYPE_ENDPOINT_PAUSE | MESSAGE_TYPE_ENDPOINT_RESET
-    )
 }
 
 fn device_address(message: &IOUSBHostCIMessage) -> u8 {
@@ -1255,7 +1284,8 @@ fn capabilities() -> [IOUSBHostCIMessage; 2] {
                 | MESSAGE_CONTROL_NO_RESPONSE
                 | MESSAGE_CONTROL_VALID
                 | (1 << CAPABILITIES_PORT_COUNT_PHASE),
-            data0: (1 << CAPABILITIES_TIMEOUT_PHASE) | (2 << CAPABILITIES_LATENCY_PHASE),
+            data0: (COMMAND_TIMEOUT_THRESHOLD << CAPABILITIES_TIMEOUT_PHASE)
+                | (CONNECTION_LATENCY << CAPABILITIES_LATENCY_PHASE),
             data1: 0,
         },
         IOUSBHostCIMessage {
