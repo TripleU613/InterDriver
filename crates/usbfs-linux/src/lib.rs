@@ -87,8 +87,8 @@ impl DeviceProvider for UsbfsProvider {
         let opened = open_node(bus_id)?;
         Ok(Arc::new(UsbfsDevice {
             bus_id: bus_id.to_owned(),
-            inner: Mutex::new(Inner {
-                fd: opened.fd,
+            fd: opened.fd,
+            state: Mutex::new(State {
                 claimed: opened.claimed,
                 configuration: opened.configuration,
             }),
@@ -142,27 +142,28 @@ fn open_node(bus_id: &str) -> io::Result<Opened> {
 
 const ENODEV_STATUS: i32 = -libc::ENODEV;
 
-struct Inner {
-    fd: OwnedFd,
+struct State {
     claimed: Vec<u32>,
     configuration: u8,
 }
 
+/// usbfs transfer ioctls may be issued concurrently on one fd, and the server
+/// runs every URB on its own thread. Only the interface bookkeeping is shared,
+/// so the fd is held immutably: a bulk IN parked on the mux endpoint waiting
+/// for the device never blocks the bulk OUT that makes the device answer.
 struct UsbfsDevice {
     bus_id: String,
-    inner: Mutex<Inner>,
+    fd: OwnedFd,
+    state: Mutex<State>,
     gone: AtomicBool,
 }
 
 impl DeviceSession for UsbfsDevice {
     fn submit(&self, request: TransferRequest) -> TransferCompletion {
-        let Ok(mut inner) = self.inner.lock() else {
-            return completion(Outcome::Failed(EPIPE_STATUS), Vec::new(), request.direction);
-        };
         if request.endpoint == 0 {
-            self.control(&mut inner, &request)
+            self.control(&request)
         } else {
-            self.stream(&mut inner, &request)
+            self.stream(&request)
         }
     }
 
@@ -176,20 +177,22 @@ impl DeviceSession for UsbfsDevice {
 }
 
 impl UsbfsDevice {
-    fn control(&self, inner: &mut Inner, request: &TransferRequest) -> TransferCompletion {
-        if let Some(outcome) = self.intercept(inner, request) {
+    fn control(&self, request: &TransferRequest) -> TransferCompletion {
+        if let Some(outcome) = self.intercept(request) {
             return completion(outcome, Vec::new(), Direction::Out);
         }
         let length = usize::from(u16::from_le_bytes([request.setup[6], request.setup[7]]));
-        let run = |inner: &Inner, buffer: &mut [u8]| {
-            ioctl::control(inner.fd.as_fd(), request.setup, buffer, CONTROL_TIMEOUT_MS)
-        };
         let mut buffer = vec![0_u8; length];
         if request.direction == Direction::Out {
             let copied = length.min(request.data.len());
             buffer[..copied].copy_from_slice(&request.data[..copied]);
         }
-        let outcome = run(inner, &mut buffer);
+        let outcome = ioctl::control(
+            self.fd.as_fd(),
+            request.setup,
+            &mut buffer,
+            CONTROL_TIMEOUT_MS,
+        );
         if is_device_gone(&outcome) {
             self.gone.store(true, Ordering::Release);
         }
@@ -200,20 +203,20 @@ impl UsbfsDevice {
     /// and endpoint halt state. Passing these through as raw control transfers
     /// leaves that view stale and later transfers fail with EINVAL, so they are
     /// translated into the dedicated ioctls instead.
-    fn intercept(&self, inner: &mut Inner, request: &TransferRequest) -> Option<Outcome> {
+    fn intercept(&self, request: &TransferRequest) -> Option<Outcome> {
         let request_type = request.setup[0];
         let code = request.setup[1];
         let value = u16::from_le_bytes([request.setup[2], request.setup[3]]);
         let index = u16::from_le_bytes([request.setup[4], request.setup[5]]);
         match (request_type, code) {
-            (0x00, 0x09) => Some(self.reconfigure(inner, value as u8)),
+            (0x00, 0x09) => Some(self.reconfigure(value as u8)),
             (0x01, 0x0b) => Some(ioctl::set_interface(
-                inner.fd.as_fd(),
+                self.fd.as_fd(),
                 u32::from(index),
                 u32::from(value),
             )),
             (0x02, 0x01) if value == 0 => {
-                Some(ioctl::clear_halt(inner.fd.as_fd(), u32::from(index)))
+                Some(ioctl::clear_halt(self.fd.as_fd(), u32::from(index)))
             }
             _ => None,
         }
@@ -224,32 +227,35 @@ impl UsbfsDevice {
     /// unconfigure or disturb the physical device, so only a genuine change
     /// reaches the hardware, and claimed interfaces are handed back first
     /// because usbfs refuses to switch configuration while they are held.
-    fn reconfigure(&self, inner: &mut Inner, value: u8) -> Outcome {
-        if value == 0 || value == inner.configuration {
+    fn reconfigure(&self, value: u8) -> Outcome {
+        let Ok(mut state) = self.state.lock() else {
+            return Outcome::Failed(EPIPE_STATUS);
+        };
+        if value == 0 || value == state.configuration {
             return Outcome::Transferred(0);
         }
-        for interface in std::mem::take(&mut inner.claimed) {
-            let _ = ioctl::release_interface(inner.fd.as_fd(), interface);
+        for interface in std::mem::take(&mut state.claimed) {
+            let _ = ioctl::release_interface(self.fd.as_fd(), interface);
         }
-        let outcome = ioctl::set_configuration(inner.fd.as_fd(), u32::from(value));
+        let outcome = ioctl::set_configuration(self.fd.as_fd(), u32::from(value));
         if matches!(outcome, Outcome::Failed(_)) {
             return outcome;
         }
-        inner.configuration = value;
+        state.configuration = value;
         let path = PathBuf::from(USB_DEVICES).join(&self.bus_id);
         if let Ok(interfaces) = read_interfaces(&path, &self.bus_id, value) {
             for index in 0..interfaces.len() {
                 let interface = index as u32;
-                let _ = ioctl::detach_kernel_driver(inner.fd.as_fd(), interface as i32);
-                if ioctl::claim_interface(inner.fd.as_fd(), interface).is_ok() {
-                    inner.claimed.push(interface);
+                let _ = ioctl::detach_kernel_driver(self.fd.as_fd(), interface as i32);
+                if ioctl::claim_interface(self.fd.as_fd(), interface).is_ok() {
+                    state.claimed.push(interface);
                 }
             }
         }
         outcome
     }
 
-    fn stream(&self, inner: &mut Inner, request: &TransferRequest) -> TransferCompletion {
+    fn stream(&self, request: &TransferRequest) -> TransferCompletion {
         let endpoint = match request.direction {
             Direction::In => request.endpoint | 0x80,
             Direction::Out => request.endpoint,
@@ -262,7 +268,7 @@ impl UsbfsDevice {
             }
         };
         let mut buffer = make_buffer();
-        let outcome = ioctl::bulk(inner.fd.as_fd(), endpoint, &mut buffer, TRANSFER_TIMEOUT_MS);
+        let outcome = ioctl::bulk(self.fd.as_fd(), endpoint, &mut buffer, TRANSFER_TIMEOUT_MS);
         if is_device_gone(&outcome) {
             self.gone.store(true, Ordering::Release);
         }
@@ -278,12 +284,12 @@ fn is_device_gone(outcome: &Outcome) -> bool {
 
 impl Drop for UsbfsDevice {
     fn drop(&mut self) {
-        if let Ok(inner) = self.inner.lock() {
-            for interface in &inner.claimed {
-                let _ = ioctl::release_interface(inner.fd.as_fd(), *interface);
-                let _ = ioctl::attach_kernel_driver(inner.fd.as_fd(), *interface as i32);
+        if let Ok(state) = self.state.lock() {
+            for interface in &state.claimed {
+                let _ = ioctl::release_interface(self.fd.as_fd(), *interface);
+                let _ = ioctl::attach_kernel_driver(self.fd.as_fd(), *interface as i32);
             }
-            let _ = ioctl::reset(inner.fd.as_fd());
+            let _ = ioctl::reset(self.fd.as_fd());
         }
     }
 }

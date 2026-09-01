@@ -78,6 +78,7 @@ const MESSAGE_STATUS_NO_RESOURCES: i32 = 6;
 const MESSAGE_STATUS_OVERRUN: i32 = 10;
 const MESSAGE_STATUS_STALL: i32 = 11;
 const MESSAGE_STATUS_ERROR: i32 = 13;
+const ENDPOINT_STATE_HALTED: i32 = 1;
 const ENDPOINT_STATE_ACTIVE: i32 = 3;
 const TRANSFER_COMPLETION_NOT_SENT: isize = -536870174;
 const DEVICE_SPEED_NONE: u32 = 0;
@@ -1043,11 +1044,15 @@ impl MacController {
             return Ok(());
         };
         endpoint.pending_sequence = None;
-        if key.endpoint & 0x0f == 0 {
-            let sp = endpoint.setup.unwrap_or([0;8]);
+        if trace_enabled() {
+            let sp = endpoint.setup.unwrap_or([0; 8]);
+            let ep = key.endpoint;
             match &result {
-                Ok(c) => trace!("FIN ep0 req={:02x?} data={:02x?} len={}", sp, &c.data[..c.data.len().min(8)], c.actual_length),
-                Err(e) => trace!("FIN ep0 req={:02x?} ERR {e:?}", sp),
+                Ok(c) => trace!(
+                    "FIN ep{ep:#04x} req={:02x?} st={} data={:02x?} len={}",
+                    sp, c.status, &c.data[..c.data.len().min(8)], c.actual_length
+                ),
+                Err(e) => trace!("FIN ep{ep:#04x} req={:02x?} ERR {e:?}", sp),
             }
         }
 
@@ -1094,12 +1099,20 @@ impl MacController {
         };
 
         if !no_response {
+            trace!(
+                "  REPORT ep{:#04x} ci_status={status} len={actual_length}",
+                key.endpoint
+            );
             complete_endpoint_transfer(
                 &endpoint.state_machine,
                 message as *const IOUSBHostCIMessage,
                 status,
                 actual_length,
             )?;
+        }
+        let post = endpoint.state_machine.endpoint_state();
+        if post == ENDPOINT_STATE_HALTED {
+            trace!("  !! ep{:#04x} HALTED after ci_status={status}", key.endpoint);
         }
 
         let deferred = endpoint.deferred_command.take();
