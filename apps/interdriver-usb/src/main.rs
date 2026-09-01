@@ -892,10 +892,12 @@ fn macos_export(_bus_id: &str, _port: u16) -> Result<(), String> {
 
 #[cfg(target_os = "macos")]
 fn macos_attach(remote: &str, bus_id: &str, ticket: Option<[u8; 32]>) -> Result<(), String> {
+    // Short: this is retried in a loop while a device is expected back on the
+    // port, so a stalled connect must not become a blackout the host notices.
     interdriver_platform_macos::run_remote_with_ticket(
         (remote, 3240),
         bus_id,
-        std::time::Duration::from_secs(10),
+        std::time::Duration::from_secs(3),
         ticket,
     )
 }

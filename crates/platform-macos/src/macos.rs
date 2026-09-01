@@ -91,7 +91,7 @@ const LINK_STATE_RX_DETECT: u32 = 5;
 const LINK_STATE_RESET: u32 = 9;
 const MAX_TRANSFER_LINKS: u32 = 64;
 const RECONNECT_MIN: Duration = Duration::from_millis(250);
-const RECONNECT_MAX: Duration = Duration::from_secs(2);
+const RECONNECT_MAX: Duration = Duration::from_secs(1);
 const MAX_DOORBELLS: usize = 4096;
 const TRANSFER_LENGTH_MASK: u32 = (1 << 28) - 1;
 const TRANSFER_FLAG_ISO_ASAP: u32 = 2;
@@ -238,8 +238,20 @@ impl IOUSBHostCIPortStateMachine {
         #[unsafe(method(setPowered:))]
         fn set_powered(&self, powered: bool);
 
+        #[unsafe(method(powered))]
+        fn powered(&self) -> bool;
+
         #[unsafe(method(setConnected:))]
         fn set_connected(&self, connected: bool);
+
+        #[unsafe(method(connected))]
+        fn connected(&self) -> bool;
+
+        #[unsafe(method(portState))]
+        fn port_state(&self) -> i32;
+
+        #[unsafe(method(portStatus))]
+        fn port_status(&self) -> u32;
 
         #[unsafe(method(updateLinkState:speed:inhibitLinkStateChange:error:))]
         unsafe fn update_link_state(
@@ -620,9 +632,12 @@ impl MacController {
     fn detach(&mut self) -> Result<(), String> {
         self.session = None;
         self.remote_connected = false;
-        self.endpoints.clear();
-        self.devices.clear();
-        self.next_device_address = 1;
+        // The device and endpoint state machines are deliberately kept. Reporting
+        // the port disconnected makes the kernel tear its own device down, and it
+        // does that by sending endpoint and device commands that we must answer.
+        // Dropping them here left nothing to answer with, so those commands were
+        // silently ignored and the kernel waited forever for a response that was
+        // never coming. The handlers remove each one as it is destroyed.
         self.signal_root_port()
     }
 
@@ -632,12 +647,34 @@ impl MacController {
         let Some(state_machine) = self.port.as_ref() else {
             return Ok(());
         };
-        // Writing `connected` on a powered port is itself the notification: it
-        // raises a PortEvent with ConnectChange set, and the kernel then comes
-        // back with port commands to interrogate the port, which is where we
-        // report the link state. Driving updateLinkState from here is rejected,
-        // as it is not valid in every port state.
+        // Writing `connected` on a powered port raises a PortEvent with
+        // ConnectChange set, but that alone will never enumerate: the port status
+        // must also carry a link speed, and a port reporting DeviceSpeedNone is
+        // one the kernel leaves alone. updateLinkState is what publishes the
+        // speed, so a newly connected device needs it. It stays skipped while
+        // disconnected, where there is no link to describe and the call is
+        // rejected outright.
+        let before = (
+            state_machine.port_state(),
+            state_machine.powered(),
+            state_machine.connected(),
+            state_machine.port_status(),
+        );
         state_machine.set_connected(self.remote_connected);
+        if self.remote_connected {
+            self.update_port_link(state_machine, LINK_STATE_U0)?;
+        }
+        trace!(
+            "PORT want_connected={} state={}->{} powered={} connected={}->{} status={:#010x}->{:#010x}",
+            self.remote_connected,
+            before.0,
+            state_machine.port_state(),
+            before.1,
+            before.2,
+            state_machine.connected(),
+            before.3,
+            state_machine.port_status()
+        );
         Ok(())
     }
 
