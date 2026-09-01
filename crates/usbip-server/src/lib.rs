@@ -46,6 +46,8 @@ pub struct TransferCompletion {
     pub iso_packets: Vec<IsoPacketDescriptor>,
 }
 
+const DISCONNECT_POLL: Duration = Duration::from_millis(250);
+
 pub trait DeviceSession: Send + Sync + 'static {
     fn submit(&self, request: TransferRequest) -> TransferCompletion;
     fn cancel(&self, endpoint: u32);
@@ -224,7 +226,29 @@ fn import_device(mut stream: TcpStream, provider: Arc<dyn DeviceProvider>) -> io
     )?;
     stream.write_all(&description.device.encode())?;
     stream.flush()?;
+    watch_for_disconnect(&stream, Arc::clone(&device))?;
     transfer_loop(stream, device)
+}
+
+/// Ends the connection when the device goes away, even with nothing in flight.
+/// A device is not only lost through a failed transfer: while the importing host
+/// waits for a rebooting device there is no traffic to fail, so without this the
+/// session would sit on a device that is already gone.
+fn watch_for_disconnect(stream: &TcpStream, device: Arc<dyn DeviceSession>) -> io::Result<()> {
+    let stream = stream.try_clone()?;
+    thread::Builder::new()
+        .name("interdriver-usbip-watchdog".into())
+        .spawn(move || {
+            while !device.disconnected() {
+                thread::sleep(DISCONNECT_POLL);
+                // The connection closing is the other way this thread retires.
+                if stream.peer_addr().is_err() {
+                    return;
+                }
+            }
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        })?;
+    Ok(())
 }
 
 struct Pending {

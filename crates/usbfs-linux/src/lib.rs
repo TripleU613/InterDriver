@@ -88,6 +88,7 @@ impl DeviceProvider for UsbfsProvider {
         let opened = open_node(bus_id)?;
         Ok(Arc::new(UsbfsDevice {
             bus_id: bus_id.to_owned(),
+            device_number: opened.device_number,
             fd: opened.fd,
             state: Mutex::new(State {
                 claimed: opened.claimed,
@@ -102,6 +103,7 @@ struct Opened {
     fd: OwnedFd,
     claimed: Vec<u32>,
     configuration: u8,
+    device_number: u32,
 }
 
 /// Opens the current device on a bus id (physical port) and claims its
@@ -138,10 +140,18 @@ fn open_node(bus_id: &str) -> io::Result<Opened> {
         fd,
         claimed,
         configuration: description.device.configuration_value,
+        device_number: u32::from(description.device.device_number),
     })
 }
 
 const ENODEV_STATUS: i32 = -libc::ENODEV;
+
+/// The device number currently occupying a physical port, or `None` if the port
+/// is empty.
+fn current_device_number(bus_id: &str) -> Option<u32> {
+    let path = PathBuf::from(USB_DEVICES).join(bus_id).join("devnum");
+    fs::read_to_string(path).ok()?.trim().parse().ok()
+}
 
 struct State {
     claimed: Vec<u32>,
@@ -154,6 +164,10 @@ struct State {
 /// for the device never blocks the bulk OUT that makes the device answer.
 struct UsbfsDevice {
     bus_id: String,
+    /// The device number this session opened. The bus id is a physical port and
+    /// outlives any device on it, so a change here means the device we were
+    /// carrying went away and a different one arrived.
+    device_number: u32,
     fd: OwnedFd,
     state: Mutex<State>,
     gone: AtomicBool,
@@ -173,7 +187,16 @@ impl DeviceSession for UsbfsDevice {
     fn cancel(&self, _endpoint: u32) {}
 
     fn disconnected(&self) -> bool {
-        self.gone.load(Ordering::Acquire)
+        if self.gone.load(Ordering::Acquire) {
+            return true;
+        }
+        // A failed transfer is not the only way to lose a device: when the host
+        // goes quiet waiting for a rebooting phone, nothing is in flight to fail.
+        // Watch the port itself so the session ends promptly either way.
+        match current_device_number(&self.bus_id) {
+            Some(number) => number != self.device_number,
+            None => true,
+        }
     }
 }
 
