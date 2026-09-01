@@ -375,6 +375,10 @@ struct MacController {
     session: Option<Session>,
     next_device_address: u8,
     devices: HashMap<u8, Retained<IOUSBHostCIDeviceStateMachine>>,
+    /// Kept so the port can be cycled between devices without a command to
+    /// hang the lookup off. The kernel addresses the root port early and it
+    /// outlives every device that appears on it.
+    port: Option<Retained<IOUSBHostCIPortStateMachine>>,
     endpoints: HashMap<EndpointKey, Endpoint>,
 }
 
@@ -440,6 +444,7 @@ impl MacController {
             session,
             next_device_address: 1,
             devices: HashMap::new(),
+            port: None,
             endpoints: HashMap::new(),
         })
     }
@@ -546,13 +551,14 @@ impl MacController {
         ensure_accepted(responded, error, "controller command response")
     }
 
-    fn handle_port_command(&self, command: &IOUSBHostCIMessage) -> Result<(), String> {
+    fn handle_port_command(&mut self, command: &IOUSBHostCIMessage) -> Result<(), String> {
         let mut error = std::ptr::null_mut();
         let state_machine = unsafe {
             self.controller
                 .port_state_machine_for_command(command, &mut error)
         }
         .ok_or_else(|| operation_error(error, "root-port state machine lookup"))?;
+        self.port = Some(state_machine.clone());
 
         error = std::ptr::null_mut();
         let accepted = unsafe { state_machine.inspect_command(command, &mut error) };
@@ -599,11 +605,54 @@ impl MacController {
         ensure_accepted(responded, error, "root-port command response")
     }
 
+    /// Puts a freshly imported device on the root port. The controller itself is
+    /// not rebuilt, so macOS sees a device arriving on a port it already knows.
+    fn attach(&mut self, session: Session, speed: u32) -> Result<(), String> {
+        self.session = Some(session);
+        self.remote_speed = speed;
+        self.remote_connected = true;
+        self.signal_root_port()
+    }
+
+    /// Takes the device off the root port and drops the state machines that
+    /// described it. The kernel tears its own device down in response, which is
+    /// what it would do for a physical unplug.
+    fn detach(&mut self) -> Result<(), String> {
+        self.session = None;
+        self.remote_connected = false;
+        self.endpoints.clear();
+        self.devices.clear();
+        self.next_device_address = 1;
+        self.signal_root_port()
+    }
+
+    fn signal_root_port(&self) -> Result<(), String> {
+        // Before the kernel has addressed the port there is nothing to signal;
+        // it will read the current state when it gets there.
+        let Some(state_machine) = self.port.as_ref() else {
+            return Ok(());
+        };
+        // Writing `connected` on a powered port is itself the notification: it
+        // raises a PortEvent with ConnectChange set, and the kernel then comes
+        // back with port commands to interrogate the port, which is where we
+        // report the link state. Driving updateLinkState from here is rejected,
+        // as it is not valid in every port state.
+        state_machine.set_connected(self.remote_connected);
+        Ok(())
+    }
+
     fn update_port_link(
         &self,
         state_machine: &IOUSBHostCIPortStateMachine,
         link_state: u32,
     ) -> Result<(), String> {
+        // A link only exists while a device is on the port. The kernel still
+        // powers, resets and interrogates an empty port, and updating the link
+        // state in that condition is rejected -- correctly, since there is no
+        // link to describe. The port state machine reports RxDetect on its own.
+        if !self.remote_connected {
+            return Ok(());
+        }
         let mut error = std::ptr::null_mut();
         let speed = if self.remote_connected {
             self.remote_speed
@@ -1190,41 +1239,68 @@ pub fn run_remote_with_ticket<A: ToSocketAddrs>(
         .next()
         .ok_or_else(|| "USB/IP host has no usable address".to_string())?;
 
-    // The link follows the physical port, not one device. A phone that reboots,
-    // drops into recovery, or re-enumerates its way through a restore comes back
-    // on the same bus id as a different device, so nothing here is fatal: every
-    // failure holds the port and retries. Only an unusable address gives up.
-    let mut backoff = RECONNECT_MIN;
-    let mut last_wait: Option<String> = None;
     loop {
-        match serve_attached(remote, bus_id, connect_timeout, ticket) {
-            Ok(()) => {
-                eprintln!("{bus_id}: device went away; holding the port");
-                backoff = RECONNECT_MIN;
-                last_wait = None;
-            }
-            Err(error) => {
-                // Report each distinct reason once so a long wait for a device
-                // that is busy restoring does not bury the log.
-                if last_wait.as_deref() != Some(error.as_str()) {
-                    eprintln!("{bus_id}: waiting for the device ({error})");
-                    last_wait = Some(error);
-                }
-                backoff = (backoff * 2).min(RECONNECT_MAX);
-            }
+        if let Err(error) = hold_port(remote, bus_id, connect_timeout, ticket) {
+            eprintln!("{bus_id}: controller fault ({error}); rebuilding it");
+            thread::sleep(RECONNECT_MIN);
         }
-        thread::sleep(backoff);
     }
 }
 
-/// One attachment, from import to the device going away. Returns `Ok` when the
-/// device disconnected cleanly and `Err` for anything the caller should retry.
-fn serve_attached(
+/// Holds `bus_id` on one virtual controller for as long as that controller stays
+/// healthy, carrying whatever device is on the port across re-enumerations.
+fn hold_port(
     remote: SocketAddr,
     bus_id: &str,
     connect_timeout: Duration,
     ticket: Option<[u8; 32]>,
 ) -> Result<(), String> {
+    autoreleasepool(|_| -> Result<(), String> {
+        // One controller for the life of the link. Rebuilding it per device made
+        // the whole USB bus vanish from macOS on every re-enumeration, so a host
+        // operation that follows a device across a reboot -- a restore stepping
+        // from Recovery into RestoreOS -- lost it. Keeping the controller and
+        // cycling only the port makes a re-enumeration look like what it is: a
+        // replug on a port the kernel already knows.
+        let mut controller = MacController::create(None, DEVICE_SPEED_HIGH)?;
+        let mut backoff = RECONNECT_MIN;
+        let mut last_wait: Option<String> = None;
+        loop {
+            match import_device(remote, bus_id, connect_timeout, ticket) {
+                Ok((session, speed, product_id)) => {
+                    eprintln!("{bus_id}: attached 05ac:{product_id:04x}");
+                    controller.attach(session, speed)?;
+                    while !controller.remote_closed() {
+                        controller.service_for(Duration::from_millis(250))?;
+                    }
+                    controller.detach()?;
+                    eprintln!("{bus_id}: device left the port; holding it open");
+                    backoff = RECONNECT_MIN;
+                    last_wait = None;
+                }
+                Err(error) => {
+                    if last_wait.as_deref() != Some(error.as_str()) {
+                        eprintln!("{bus_id}: waiting for a device ({error})");
+                        last_wait = Some(error);
+                    }
+                    // Keep answering the kernel while waiting. A command timeout
+                    // is fatal, so the controller cannot go unserviced just
+                    // because the port is empty.
+                    controller.service_for(backoff)?;
+                    backoff = (backoff * 2).min(RECONNECT_MAX);
+                }
+            }
+        }
+    })
+}
+
+/// Imports the device currently on `bus_id`, ready to be put on the root port.
+fn import_device(
+    remote: SocketAddr,
+    bus_id: &str,
+    connect_timeout: Duration,
+    ticket: Option<[u8; 32]>,
+) -> Result<(Session, u32, u16), String> {
     let imported =
         interdriver_usbip_client::import_with_ticket(remote, bus_id, connect_timeout, ticket)
             .map_err(|error| error.to_string())?;
@@ -1237,14 +1313,7 @@ fn serve_attached(
     let speed = usbip_speed_to_ci(imported.device.speed);
     let product_id = imported.device.product_id;
     let session = Session::from_imported(imported).map_err(|error| error.to_string())?;
-    eprintln!("{bus_id}: attached 05ac:{product_id:04x}");
-    autoreleasepool(|_| -> Result<(), String> {
-        let mut controller = MacController::create(Some(session), speed)?;
-        while !controller.remote_closed() {
-            controller.service_for(Duration::from_millis(250))?;
-        }
-        Ok(())
-    })
+    Ok((session, speed, product_id))
 }
 
 fn transfer_request(
