@@ -396,3 +396,40 @@ tunnel: `windows attach` pulled the 18-byte device descriptor and 1771-byte
 configuration, and Windows enumerated it as a real composite USB device
 (`SD webcam 5160` + `USB Microphone` + `USB Composite Device`, all OK). The
 remote Linux device works as a real device on Windows.
+
+## macOS import — exact failure loop (2026-09-01, on branch codex/macos-0x45-pause-fix)
+
+Codex's pause/resume fix removed the crash: the Apple vendor request 0xc0/0x45
+now completes with the endpoint Active. But the device still doesn't reach
+cfgutil. Traced the precise post-0x45 sequence on hardware:
+
+```
+CTRL [c0 45 00 00 00 00 04 00] len=4   kernel issues vendor 0x45 (data stage) on ep0
+CMD  0x2b (EndpointPause) d0=1          kernel pauses ep0 (device 1, ep 0)
+CTRL [c0 45 ...]                        kernel RE-ISSUES 0x45
+CMD  0x2b x3                            pauses again
+CTRL [c0 45 ...]                        re-issues 0x45 (3rd time)
+"Failed to send interrupts to kernel"   -> controller torn down
+```
+
+Mechanism: the kernel pauses ep0 within ~milliseconds of issuing 0x45, well
+before our ~110 ms remote round trip returns. The Active-guard in
+complete_endpoint_transfer therefore DROPS the 0x45 completion (endpoint is
+Paused when the answer arrives), so the kernel never receives the 4-byte answer,
+re-issues 0x45, and the loop repeats 3x before the kernel gives up (the
+"Failed to send interrupts" messages are the teardown side effect, not the
+cause). Latency is ~5 ms (direct), so this is NOT a timeout.
+
+CONFIG NOTE (grounded): the iPhone advertises bNumConfigurations=4 while
+untrusted (config 4 = PTP + Apple Mobile Device + Ethernet, which already
+contains the mux interface), and exposes a 5th "trusted" config only after
+pairing (paired-Mac ground truth). Config 5 is therefore NOT required for the
+mux interface or for cfgutil to bind — the blocker is the 0x45 completion loop
+above, not the config count.
+
+FIX DIRECTION (controller author): the 0x45 control completion must reach the
+kernel. Either complete it during the Active window before the kernel pauses
+(don't drop it on pause), deliver a held completion on resume that the kernel
+accepts, or handle the DATA->pause->STATUS control-transfer sequencing so the
+kernel advances past 0x45 instead of re-issuing. This is intricate IOUSBHostCI
+control-transfer state-machine work.
