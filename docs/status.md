@@ -494,6 +494,19 @@ Four defects stood between the controller and this, all found against
    array to the next, was treated as unsupported, killing the session at the
    first ring wrap (~480 transfers in).
 
+### Caveats
+
+A reset or re-enumeration *during* an operation (`cfgutil erase`, a restore) now
+surfaces as a session teardown and controller rebuild rather than the transparent
+reopen the exporter used to do. That is what a physical host sees, but it has not
+yet been exercised against a real erase -- the user deferred the wipe.
+
+An idle IN pipe used to be reported as a Timeout, which halts the endpoint on the
+importing host and killed usbmux mid-session. usbfs transfers are synchronous, so
+we give up where a real controller would leave the URB queued; a quiet IN read is
+now retired empty instead. The only halt left in a long run is ep0 going Offline
+during the trust re-enumeration, which is the device genuinely going away.
+
 ### Throughput
 
 Correct but latency-bound: one transfer in flight per endpoint, and this pair

@@ -17,6 +17,7 @@ const USB_DEVICES: &str = "/sys/bus/usb/devices";
 const CONTROL_TIMEOUT_MS: u32 = 5_000;
 const TRANSFER_TIMEOUT_MS: u32 = 30_000;
 const EPIPE_STATUS: i32 = -32;
+const TIMEOUT_STATUS: i32 = -libc::ETIMEDOUT;
 
 /// Exports physically attached devices straight from usbfs, with no
 /// `usbip_host` binding and no `usbipd` process.
@@ -268,9 +269,18 @@ impl UsbfsDevice {
             }
         };
         let mut buffer = make_buffer();
-        let outcome = ioctl::bulk(self.fd.as_fd(), endpoint, &mut buffer, TRANSFER_TIMEOUT_MS);
+        let mut outcome = ioctl::bulk(self.fd.as_fd(), endpoint, &mut buffer, TRANSFER_TIMEOUT_MS);
         if is_device_gone(&outcome) {
             self.gone.store(true, Ordering::Release);
+        }
+        // An IN pipe that stayed quiet is not a device error: usbfs transfers are
+        // synchronous, so we give up where a real controller would leave the URB
+        // queued. Retire it empty. Reporting a failure instead halts the endpoint
+        // on the importing host, which kills an idle usbmux pipe mid-session.
+        if request.direction == Direction::In
+            && matches!(outcome, Outcome::Failed(status) if status == TIMEOUT_STATUS)
+        {
+            outcome = Outcome::Transferred(0);
         }
         completion(outcome, buffer, request.direction)
     }
@@ -462,5 +472,19 @@ mod tests {
                 "interface count must match the records the server will send"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod timeout_tests {
+    use super::*;
+
+    #[test]
+    fn quiet_in_pipe_retires_empty_but_real_failures_still_fail() {
+        let quiet = Outcome::Failed(TIMEOUT_STATUS);
+        let stalled = Outcome::Failed(EPIPE_STATUS);
+        let retire = |o: &Outcome| matches!(o, Outcome::Failed(s) if *s == TIMEOUT_STATUS);
+        assert!(retire(&quiet), "an idle IN read must not be reported as a failure");
+        assert!(!retire(&stalled), "a stall must still surface as a failure");
     }
 }
