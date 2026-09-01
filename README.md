@@ -1,74 +1,275 @@
-# interdriver
+# interdriver-usb
 
-Private InterDriver project for exporting a USB device from Windows, Linux, or macOS and presenting it as a locally attached USB device on Windows, Linux, or macOS. The Apple Configurator use case is Linux/Windows to macOS, but the transport supports the complete 3x3 platform matrix.
+Plug a USB device into one machine and use it on another as if it were plugged in
+locally. Not a file share, not a socket proxy — the importing operating system
+enumerates a real USB device, so software that refuses to talk to anything else
+works unmodified.
 
-## Feasibility
+The case this was built for: **an iPhone plugged into a Windows or Linux box in
+one office, driven by Apple Configurator on a Mac somewhere else.** Configurator
+only talks to a USB device in IOKit, so a `usbmuxd` socket forward is not enough.
+This creates the real thing.
 
-The design is technically possible. USB/IP already defines how a physical USB device is exported as USB requests and imported through a virtual host controller. The difficult component is the macOS importer: Apple Configurator only documents iPhone and iPad preparation over a USB connection, so the imported device must exist in macOS IOKit as a complete USB device. A TCP proxy or remote `usbmuxd` socket alone is insufficient for unmodified Configurator.
+Clean-room USB/IP 1.1.1. No Electronic Team or usbipd-win code.
 
-Apple exposes `IOUSBHostControllerInterface` for a user-space virtual host controller. Shipping software that uses it requires the managed `com.apple.developer.usb.host-controller-interface` entitlement. Apple accepts entitlement requests for products that represent a network-attached USB device locally. Development without that entitlement requires disabling SIP, which must not be done on the production Drone Mac.
+---
 
-## First Milestone
+## What works
 
-Prove one direct connection before building a relay or UI:
+Every direction is implemented and has been run on real hardware.
 
-1. Attach an iPhone to a dedicated Linux test computer.
-2. Export the entire Apple USB device using USB/IP.
-3. Import it on a dedicated Mac through `IOUSBHostControllerInterface`.
-4. Confirm the device appears in `ioreg`, `system_profiler`, and `cfgutil list`.
-5. Confirm trust, pairing, erase, reboot, and USB re-enumeration.
-6. Run one Apple Configurator prepare operation and verify the resulting ABM assignment.
+| Device plugged into ↓ / Software runs on → | Linux | macOS | Windows |
+| --- | --- | --- | --- |
+| **Linux** | yes | yes | yes |
+| **macOS** | yes | yes | yes |
+| **Windows** | yes | yes | yes |
 
-The first milestone is not complete merely because Lockdown or `usbmuxd` works. Apple Configurator must see and operate on the virtual IOKit device.
+Proven end to end: Apple Configurator on a MacBook driving an iPhone physically
+attached to a Linux box — `cfgutil list` returns the real ECID and UDID, and a
+full iOS restore streams over the link.
 
-## Project Rules
+---
 
-- Keep this project private.
-- Do not copy Electronic Team binaries or protocol implementation into this directory.
-- Do not copy code from repositories without a usable license.
-- Use the documented USB/IP protocol for the clean-room data plane.
-- Never expose unencrypted USB/IP port 3240 to the public internet.
-- Do not log USB payloads, pairing records, activation records, or Configurator credentials.
-- Do not disable SIP on the production release runner.
+## The 60-second version
+
+Two commands. One machine exports, the other imports.
+
+```bash
+# On the machine with the device plugged in:
+interdriver-usb linux export 3-12 3240
+
+# On the machine that should see it:
+interdriver-usb macos attach 192.0.2.10 3-12
+```
+
+`3-12` is the *port*, not the device. Whatever is plugged into that port is what
+gets carried — if the device reboots or re-enumerates, the link follows it.
+
+---
+
+## Guide: Windows device → Apple Configurator on a Mac
+
+This is the hardest path in the project. Follow it in order; the two steps people
+lose a day to are marked **← this one**.
+
+### 1. Windows: find the device
+
+```powershell
+interdriver-usb windows list
+```
+
+Nothing listed? That is expected before the next step — Windows only shows
+devices bound to WinUSB here, and an iPhone ships bound to Apple's driver.
+
+### 2. Windows: bind the interface to WinUSB, then **reboot** ← this one
+
+The exporter opens the device through WinUSB, so the interface must be bound to
+it. For an iPhone that means the `MI_01` interface (Apple USB Multiplexor).
+
+```powershell
+interdriver-usb windows install-driver C:\path\to\interdriver-winusb.inf
+```
+
+**Reboot before you try anything else.** A forced driver swap leaves Windows in a
+"reboot pending" state, and until you reboot, `CreateFileW` on the interface
+fails with `ERROR_NOT_SUPPORTED (50)` and nothing you do to the code will help.
+
+After the reboot, `interdriver-usb windows list` shows the device and its bus id.
+
+To undo it later: Device Manager → the `MI_01` device → Uninstall device, tick
+*delete driver*, then Scan for hardware changes. Apple's driver comes back.
+
+### 3. Windows: export it
+
+```powershell
+interdriver-usb windows export <bus-id> 3240
+```
+
+Leave it running. It holds the port, not the device.
+
+### 4. Mac: get the entitlement problem out of the way ← this one
+
+A user-space virtual USB host controller needs Apple's managed entitlement
+`com.apple.developer.usb.host-controller-interface`. Request it for anything you
+ship (draft in `docs/apple-entitlement-request.md` — it needs a Team ID).
+
+For development, bypass it on a **scratch Mac only**:
+
+```bash
+# 1. Boot to recovery, disable SIP
+csrutil disable
+
+# 2. Back in macOS, allow the unentitled binary to run
+sudo nvram boot-args="amfi_get_out_of_my_way=0x1"
+sudo reboot
+
+# 3. After the reboot, sign the binary ad-hoc every time you rebuild
+codesign --force --sign - \
+  --entitlements crates/platform-macos/entitlements.plist \
+  target/debug/interdriver-usb
+```
+
+Never do this on a machine that ships builds or holds signing keys. SIP off is
+the whole security model off.
+
+Skip the codesign step and the process dies instantly with exit 137 and no
+useful message — that is AMFI killing it, not a crash.
+
+### 5. Mac: attach
+
+```bash
+interdriver-usb macos attach <windows-host> <bus-id>
+```
+
+You should see:
+
+```
+<bus-id>: attached 05ac:12a8
+```
+
+### 6. Mac: confirm Configurator can actually see it
+
+```bash
+ioreg -p IOUSB -w0 | grep -A2 AppleUSBUserHCI
+cfgutil list
+```
+
+`ioreg` should show your `AppleUSBUserHCI` with the device as a child, and
+`cfgutil list` should print the real ECID and UDID. If `ioreg` shows the device
+but `cfgutil` shows nothing, the device enumerated but was never configured —
+see Troubleshooting.
+
+---
+
+## Per-platform requirements
+
+**Linux (export)** — nothing to install. Uses usbfs directly; no `usbip_host`,
+no `usbipd`. Needs root for `/dev/bus/usb`. Find the port with
+`interdriver-usb linux list`; bus ids look like `3-12` and match `/sys/bus/usb/devices/`.
+
+**Linux (import)** — needs the in-tree `vhci_hcd` module (`modprobe vhci-hcd`).
+
+**macOS (export)** — no entitlement and no root. Takes exclusive ownership of the
+`IOUSBHostDevice`, so unplug it from Configurator first.
+
+**macOS (import)** — entitlement, or the SIP-off bypass above. This is the only
+platform with a hard gate.
+
+**Windows (export)** — WinUSB-bound interface plus a reboot after binding.
+
+**Windows (import)** — the UdeCx virtual host controller driver in
+`driver/windows-ude/`. Test-signed builds need `bcdedit /set testsigning on`.
+
+---
+
+## Locking it down
+
+The data plane is plain USB/IP on port 3240. **Never expose 3240 to the
+internet.** Two mechanisms are built in.
+
+**Single-use tickets** — a broker issues a token scoped to one device, one
+exporter, one importer, with a TTL. One consumer per device; revocation takes
+effect mid-session.
+
+```bash
+interdriver-usb broker 9000                                    # run the broker
+interdriver-usb issue 10.0.0.5:9000 3-12 edge-1 mac-1 300      # mint a ticket
+interdriver-usb linux export 3-12 3240 --broker 10.0.0.5:9000 --exporter edge-1
+interdriver-usb macos attach 10.0.0.5 3-12 --ticket <hex>
+interdriver-usb sessions 10.0.0.5:9000                         # who holds what
+interdriver-usb revoke  10.0.0.5:9000 <token>                  # cut a session off
+```
+
+**mTLS** — both planes can run inside a mutually authenticated tunnel.
+
+```bash
+interdriver-usb tls init ./certs
+interdriver-usb tls serve   3241 127.0.0.1:3240 ./certs        # exporter side
+interdriver-usb tls forward 3240 exporter-host:3241 exporter ./certs   # importer side
+```
+
+Do not log USB payloads, pairing records, activation records, or Configurator
+credentials.
+
+---
+
+## Troubleshooting
+
+**Mac process exits immediately, code 137** — AMFI killed it. You skipped the
+ad-hoc `codesign`, or `amfi_get_out_of_my_way` is not set.
+
+**Windows `CreateFileW` fails with ERROR_NOT_SUPPORTED (50)** — you have not
+rebooted since binding WinUSB.
+
+**Device shows in `ioreg` but `cfgutil list` is empty** — enumerated but not
+configured. Run the Mac side with `INTERDRIVER_TRACE=1` and look for
+`req=[00, 09, ...]` (SET_CONFIGURATION). No such line means the host is still
+probing and gave up.
+
+**Everything is slow** — see Known limits. Check whether your network is actually
+direct: `tailscale ping <host>`. A relayed path multiplies every USB round trip.
+
+**iPhone keeps dropping and coming back** — that is usually correct. Trust,
+reboots, recovery mode and restores all re-enumerate the device, and the link is
+built to follow that. `attached 05ac:1281` is recovery mode, `05ac:12a8` is
+normal or RestoreOS.
+
+**Reading the trace** — `INTERDRIVER_TRACE=1` on either side prints the protocol.
+
+```
+FIN ep0x04 req=[...] st=0 len=32768/32768   transfer done, full length
+  <-- SHORT                                  fewer bytes than asked for
+st=-32                                       device sent a STALL
+CMD 0x1c / 0x20 / 0x28                       port reset / device create / endpoint create
+```
+
+---
+
+## Known limits
+
+**Throughput is round-trip bound.** One transfer is in flight per endpoint, so
+throughput is roughly *transfer size ÷ RTT*. On a LAN this is fine. Over a
+relayed link (~60 ms RTT) it lands near 400 KiB/s, which makes a multi-gigabyte
+iOS restore take hours.
+
+The fix is URB pipelining — several transfers in flight per endpoint. It must
+preserve per-endpoint completion ordering, because a reordered bulk stream is a
+corrupted firmware write.
+
+**Check your path before blaming the code.** Tailscale silently falls back to a
+DERP relay; `tailscale ping` tells you whether you have a direct route.
+
+---
 
 ## Layout
 
-- `apps/interdriver-usb`: Rust development CLI for platform adapters.
-- `crates/usbip-protocol`: bounded, byte-accurate USB/IP 1.1.1 codec.
-- `crates/usbip-client`: Rust device-list/import negotiation and persistent data connection.
-- `crates/usbip-session`: concurrent Rust URB submit, completion, and cancellation engine.
-- `crates/driver-core`: cross-platform device and re-enumeration lifecycle.
-- `crates/platform-linux`: Rust control of Linux `usbip_host` and `vhci_hcd`.
-- `crates/platform-macos`: Rust ABI and state machines for Apple IOUSBHost.
-- `docs/architecture.md`: proposed cross-platform architecture and delivery phases.
-- `docs/windows-reference-audit.md`: audit of the existing paid Windows tunnel.
-- `scripts/probe-linux-host.sh`: read-only Linux USB/exporter diagnostics.
-- `scripts/probe-macos-host.sh`: read-only Mac importer and Configurator diagnostics.
-
-Run the current Rust checks with:
-
-```sh
-cargo test --workspace
-cargo run -p interdriver-usb -- matrix
-cargo run -p interdriver-usb -- linux list
+```
+apps/interdriver-usb/       CLI
+crates/usbip-protocol/  wire codec
+crates/usbip-client/    importer side of USB/IP
+crates/usbip-server/    exporter side (DeviceProvider / DeviceSession)
+crates/usbfs-linux/     Linux exporter, usbfs ioctls
+crates/platform-linux/  Linux importer, kernel vhci
+crates/platform-macos/  macOS importer, IOUSBHostControllerInterface
+crates/platform-windows/ Windows exporter (WinUSB) and importer (UdeCx)
+crates/control-plane/   broker, tickets, revocation
+crates/tls/             mTLS for both planes
+driver/windows-ude/     the Windows virtual host controller driver
+docs/                   architecture, status, platform notes
 ```
 
-## Required Apple Request
+`cargo test` runs the suite (28 green).
 
-Submit an Apple Feedback Assistant request for:
+Working on the macOS importer? Read `docs/` and Apple's own headers first — they
+are in the Xcode SDK at
+`.../IOUSBHost.framework/Versions/A/Headers/IOUSBHostControllerInterfaceDefinitions.h`
+and they answer questions that are otherwise days of guessing.
 
-- Platform: macOS
-- Title: `Request for Entitlement - com.apple.developer.usb.host-controller-interface`
-- Problem Area: USB
-- Type: Other Bug
-- Include the Apple Developer Team ID, company/product overview, and company/product links.
+---
 
-Describe the product as a managed enterprise utility that creates a local virtual USB controller representing an organization-owned iPhone physically attached to an authenticated remote workstation, so Apple Configurator can prepare that device.
+## Project rules
 
-## References
-
-- [Apple Configurator device connection](https://support.apple.com/guide/apple-configurator-mac/connect-devices-cad9d4b2211e/mac)
-- [Apple IOUSBHostControllerInterface](https://developer.apple.com/documentation/iousbhost/iousbhostcontrollerinterface)
-- [Apple entitlement request guidance](https://developer.apple.com/forums/thread/802495)
-- [Linux USB/IP README](https://github.com/torvalds/linux/blob/master/tools/usb/usbip/README)
-- [Linux USB/IP protocol](https://docs.kernel.org/usb/usbip_protocol.html)
+- Keep this project private.
+- Clean-room only. Do not copy Electronic Team, usbipd-win, or any unlicensed code.
+- Never expose unencrypted port 3240 to the public internet.
+- Do not log USB payloads, pairing records, activation records, or credentials.

@@ -30,9 +30,9 @@ pub struct PlatformAdapter {
 pub const PLATFORM_ADAPTERS: [PlatformAdapter; 3] = [
     PlatformAdapter {
         platform: Platform::Linux,
-        exporter: "Rust service + usbip_host",
+        exporter: "Rust service + usbfs (no kernel module)",
         importer: "Rust service + vhci_hcd",
-        kernel_boundary: "Linux in-tree USB/IP modules",
+        kernel_boundary: "usbfs to export, in-tree vhci_hcd to import",
     },
     PlatformAdapter {
         platform: Platform::Macos,
@@ -42,7 +42,7 @@ pub const PLATFORM_ADAPTERS: [PlatformAdapter; 3] = [
     },
     PlatformAdapter {
         platform: Platform::Windows,
-        exporter: "Rust KMDF physical capture driver",
+        exporter: "Rust service + WinUSB",
         importer: "Rust KMDF UdeCx virtual controller",
         kernel_boundary: "Microsoft KMDF/UdeCx",
     },
