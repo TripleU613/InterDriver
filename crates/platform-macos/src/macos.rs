@@ -7,7 +7,7 @@ use objc2::{AnyThread, Encode, Encoding, RefEncode, extern_class, extern_methods
 use objc2_foundation::{NSData, NSError};
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::net::ToSocketAddrs;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::ptr::NonNull;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread;
@@ -90,6 +90,8 @@ const LINK_STATE_DISABLED: u32 = 4;
 const LINK_STATE_RX_DETECT: u32 = 5;
 const LINK_STATE_RESET: u32 = 9;
 const MAX_TRANSFER_LINKS: u32 = 64;
+const RECONNECT_MIN: Duration = Duration::from_millis(250);
+const RECONNECT_MAX: Duration = Duration::from_secs(2);
 const MAX_DOORBELLS: usize = 4096;
 const TRANSFER_LENGTH_MASK: u32 = (1 << 28) - 1;
 const TRANSFER_FLAG_ISO_ASAP: u32 = 2;
@@ -1187,41 +1189,62 @@ pub fn run_remote_with_ticket<A: ToSocketAddrs>(
         .map_err(|error| error.to_string())?
         .next()
         .ok_or_else(|| "USB/IP host has no usable address".to_string())?;
-    let mut connected_once = false;
+
+    // The link follows the physical port, not one device. A phone that reboots,
+    // drops into recovery, or re-enumerates its way through a restore comes back
+    // on the same bus id as a different device, so nothing here is fatal: every
+    // failure holds the port and retries. Only an unusable address gives up.
+    let mut backoff = RECONNECT_MIN;
+    let mut last_wait: Option<String> = None;
     loop {
-        let imported = match interdriver_usbip_client::import_with_ticket(
-            remote,
-            bus_id,
-            connect_timeout,
-            ticket,
-        ) {
-            Ok(imported) => imported,
-            Err(error) if connected_once => {
-                eprintln!("waiting for Apple device {bus_id} to re-enumerate: {error}");
-                thread::sleep(Duration::from_millis(500));
-                continue;
+        match serve_attached(remote, bus_id, connect_timeout, ticket) {
+            Ok(()) => {
+                eprintln!("{bus_id}: device went away; holding the port");
+                backoff = RECONNECT_MIN;
+                last_wait = None;
             }
-            Err(error) => return Err(error.to_string()),
-        };
-        if imported.device.vendor_id != 0x05ac {
-            return Err(format!(
-                "remote device {:04x}:{:04x} is not an Apple USB device",
-                imported.device.vendor_id, imported.device.product_id
-            ));
+            Err(error) => {
+                // Report each distinct reason once so a long wait for a device
+                // that is busy restoring does not bury the log.
+                if last_wait.as_deref() != Some(error.as_str()) {
+                    eprintln!("{bus_id}: waiting for the device ({error})");
+                    last_wait = Some(error);
+                }
+                backoff = (backoff * 2).min(RECONNECT_MAX);
+            }
         }
-        let speed = usbip_speed_to_ci(imported.device.speed);
-        let session = Session::from_imported(imported).map_err(|error| error.to_string())?;
-        autoreleasepool(|_| -> Result<(), String> {
-            let mut controller = MacController::create(Some(session), speed)?;
-            while !controller.remote_closed() {
-                controller.service_for(Duration::from_millis(250))?;
-            }
-            Ok(())
-        })?;
-        connected_once = true;
-        eprintln!("remote Apple device disconnected; rebuilding the virtual controller");
-        thread::sleep(Duration::from_millis(250));
+        thread::sleep(backoff);
     }
+}
+
+/// One attachment, from import to the device going away. Returns `Ok` when the
+/// device disconnected cleanly and `Err` for anything the caller should retry.
+fn serve_attached(
+    remote: SocketAddr,
+    bus_id: &str,
+    connect_timeout: Duration,
+    ticket: Option<[u8; 32]>,
+) -> Result<(), String> {
+    let imported =
+        interdriver_usbip_client::import_with_ticket(remote, bus_id, connect_timeout, ticket)
+            .map_err(|error| error.to_string())?;
+    if imported.device.vendor_id != 0x05ac {
+        return Err(format!(
+            "remote device {:04x}:{:04x} is not an Apple USB device",
+            imported.device.vendor_id, imported.device.product_id
+        ));
+    }
+    let speed = usbip_speed_to_ci(imported.device.speed);
+    let product_id = imported.device.product_id;
+    let session = Session::from_imported(imported).map_err(|error| error.to_string())?;
+    eprintln!("{bus_id}: attached 05ac:{product_id:04x}");
+    autoreleasepool(|_| -> Result<(), String> {
+        let mut controller = MacController::create(Some(session), speed)?;
+        while !controller.remote_closed() {
+            controller.service_for(Duration::from_millis(250))?;
+        }
+        Ok(())
+    })
 }
 
 fn transfer_request(

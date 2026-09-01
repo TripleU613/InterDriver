@@ -14,7 +14,6 @@ const fn ior(number: u64, size: u64) -> u64 {
 
 const USBDEVFS_CONTROL: u64 = iowr(0, 24);
 const USBDEVFS_BULK: u64 = iowr(2, 24);
-const USBDEVFS_RESET: u64 = (USBDEVFS_TYPE << 8) | 20;
 const USBDEVFS_CLAIMINTERFACE: u64 = ior(15, 4);
 const USBDEVFS_RELEASEINTERFACE: u64 = ior(16, 4);
 const USBDEVFS_IOCTL: u64 = iowr(18, 16);
@@ -232,14 +231,6 @@ pub fn attach_kernel_driver(fd: BorrowedFd<'_>, interface: i32) -> io::Result<()
     Ok(())
 }
 
-pub fn reset(fd: BorrowedFd<'_>) -> io::Result<()> {
-    let result = unsafe { libc::ioctl(fd.as_raw_fd(), USBDEVFS_RESET, 0) };
-    if result < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -256,7 +247,6 @@ mod tests {
         assert_eq!(USBDEVFS_SETINTERFACE, 0x8008_5504);
         assert_eq!(USBDEVFS_SETCONFIGURATION, 0x8004_5505);
         assert_eq!(USBDEVFS_CLEAR_HALT, 0x8004_5515);
-        assert_eq!(USBDEVFS_RESET, 0x5514);
     }
 
     #[test]

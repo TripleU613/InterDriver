@@ -299,7 +299,11 @@ impl Drop for UsbfsDevice {
                 let _ = ioctl::release_interface(self.fd.as_fd(), *interface);
                 let _ = ioctl::attach_kernel_driver(self.fd.as_fd(), *interface as i32);
             }
-            let _ = ioctl::reset(self.fd.as_fd());
+            // Deliberately no USBDEVFS_RESET here. A session ends every time the
+            // device re-enumerates, and during a restore that is constant -- the
+            // phone drops to recovery, flashes, and reboots. Resetting the port on
+            // each teardown would interrupt the very operation we are carrying.
+            // Releasing the interfaces is enough to hand the device back.
         }
     }
 }
