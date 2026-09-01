@@ -6,6 +6,7 @@ use interdriver_usbip_server::{
 };
 use interdriver_usbip_protocol::Direction;
 use ioctl::Outcome;
+use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::os::fd::{AsFd, OwnedFd};
@@ -95,6 +96,7 @@ impl DeviceProvider for UsbfsProvider {
                 configuration: opened.configuration,
             }),
             gone: AtomicBool::new(false),
+            cancels: Mutex::new(HashMap::new()),
         }))
     }
 }
@@ -171,6 +173,9 @@ struct UsbfsDevice {
     fd: OwnedFd,
     state: Mutex<State>,
     gone: AtomicBool,
+    /// Bumped per endpoint when the host unlinks a transfer. A re-armed IN read
+    /// watches its endpoint's count so an unlink actually stops it.
+    cancels: Mutex<HashMap<u32, u64>>,
 }
 
 impl DeviceSession for UsbfsDevice {
@@ -182,9 +187,15 @@ impl DeviceSession for UsbfsDevice {
         }
     }
 
-    /// usbfs synchronous transfers cannot be interrupted once issued, so an
-    /// unlink is answered by the server while the ioctl runs to completion.
-    fn cancel(&self, _endpoint: u32) {}
+    /// A usbfs transfer already in the kernel cannot be interrupted, so the
+    /// server answers the unlink while that ioctl runs out. What we can stop is
+    /// re-arming: without this a quiet IN pipe would be re-read forever and the
+    /// host could never retire the transfer it asked us to drop.
+    fn cancel(&self, endpoint: u32) {
+        if let Ok(mut cancels) = self.cancels.lock() {
+            *cancels.entry(endpoint).or_insert(0) += 1;
+        }
+    }
 
     fn disconnected(&self) -> bool {
         if self.gone.load(Ordering::Acquire) {
@@ -201,6 +212,14 @@ impl DeviceSession for UsbfsDevice {
 }
 
 impl UsbfsDevice {
+    fn cancel_generation(&self, endpoint: u32) -> u64 {
+        self.cancels
+            .lock()
+            .ok()
+            .and_then(|cancels| cancels.get(&endpoint).copied())
+            .unwrap_or(0)
+    }
+
     fn control(&self, request: &TransferRequest) -> TransferCompletion {
         if let Some(outcome) = self.intercept(request) {
             return completion(outcome, Vec::new(), Direction::Out);
@@ -299,9 +318,11 @@ impl UsbfsDevice {
         // into an empty packet. usbfs transfers are synchronous, so re-arm the read
         // instead -- that is what a real controller does by leaving the URB queued.
         // A device that goes away fails the ioctl with ENODEV and ends the loop.
+        let generation = self.cancel_generation(request.endpoint);
         while request.direction == Direction::In
             && matches!(outcome, Outcome::Failed(status) if status == TIMEOUT_STATUS)
             && !self.disconnected()
+            && self.cancel_generation(request.endpoint) == generation
         {
             outcome = ioctl::bulk(self.fd.as_fd(), endpoint, &mut buffer, TRANSFER_TIMEOUT_MS);
         }
