@@ -69,6 +69,7 @@ const MESSAGE_TYPE_SETUP_TRANSFER: u32 = 0x38;
 const MESSAGE_TYPE_NORMAL_TRANSFER: u32 = 0x39;
 const MESSAGE_TYPE_STATUS_TRANSFER: u32 = 0x3a;
 const MESSAGE_TYPE_ISOCHRONOUS_TRANSFER: u32 = 0x3b;
+const MESSAGE_TYPE_LINK: u32 = 0x3c;
 const MESSAGE_STATUS_SUCCESS: i32 = 1;
 const MESSAGE_STATUS_OFFLINE: i32 = 2;
 const MESSAGE_STATUS_NOT_PERMITTED: i32 = 3;
@@ -88,6 +89,7 @@ const LINK_STATE_U3: u32 = 3;
 const LINK_STATE_DISABLED: u32 = 4;
 const LINK_STATE_RX_DETECT: u32 = 5;
 const LINK_STATE_RESET: u32 = 9;
+const MAX_TRANSFER_LINKS: u32 = 64;
 const MAX_DOORBELLS: usize = 4096;
 const TRANSFER_LENGTH_MASK: u32 = (1 << 28) - 1;
 const TRANSFER_FLAG_ISO_ASAP: u32 = 2;
@@ -815,12 +817,21 @@ impl MacController {
         key: EndpointKey,
         endpoint: &mut Endpoint,
     ) -> Result<(), String> {
+        // Transfer messages live in arrays whose last entry is a Link pointing at
+        // the next array. `cursor` carries us across a link within one pass; it is
+        // cleared on entry so we always start from the state machine's own view.
+        let mut cursor: *const IOUSBHostCIMessage = std::ptr::null();
+        let mut links = 0_u32;
         while endpoint.pending_sequence.is_none() {
             if endpoint.state_machine.endpoint_state() != ENDPOINT_STATE_ACTIVE {
                 trace!("  drive_endpoint BAIL: ep{:#04x} state={}", key.endpoint, endpoint.state_machine.endpoint_state());
                 return Ok(());
             }
-            let pointer = endpoint.state_machine.current_transfer_message();
+            let pointer = if cursor.is_null() {
+                endpoint.state_machine.current_transfer_message()
+            } else {
+                cursor
+            };
             if pointer.is_null() {
                 return Ok(());
             }
@@ -952,6 +963,19 @@ impl MacController {
                         no_response,
                         request,
                     )?;
+                }
+                MESSAGE_TYPE_LINK => {
+                    // End of this array: follow the link to the next one. A Link
+                    // carries no transfer, so there is nothing to complete.
+                    links += 1;
+                    if links > MAX_TRANSFER_LINKS {
+                        return Err(format!(
+                            "endpoint {:#04x} transfer ring links in a cycle",
+                            key.endpoint
+                        ));
+                    }
+                    cursor = message.data1 as *const IOUSBHostCIMessage;
+                    continue;
                 }
                 unsupported => {
                     if !no_response {
