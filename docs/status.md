@@ -458,3 +458,47 @@ user-space controller's completion handling from here.
 State on this branch: 0x45 no longer crashes and its completion reaches our code
 Ok+Active. Remaining blocker: framework interrupt delivery. macOS import is the
 only non-working cell; the gadget-mode importer remains the hardware hedge.
+
+## macOS import — delivered (2026-09-01)
+
+Apple Configurator on `test-mac` drives an iPhone that is
+physically plugged into the Linux box, over `interdriver-usb`:
+
+```
+$ cfgutil list
+Type: iPhone10,1  ECID: 0xC60CC183B883A  UDID: 4a6fbe059b44f8f206f8ca96b9319078cf2c36a9
+                  Location: 0x80100000   Name: iPhone
+$ cfgutil get name
+iPhone
+```
+
+The device appears under our own `AppleUSBUserHCI` as a matched
+`IOUSBHostDevice`, is configured into the trusted configuration, and carries
+live usbmux traffic on the bulk pipes.
+
+Four defects stood between the controller and this, all found against
+`IOUSBHostControllerInterfaceDefinitions.h` rather than by guesswork:
+
+1. A completion that arrived while an EndpointPause was deferred was reported
+   as `EndpointStopped` with length 0, discarding real data. The kernel
+   re-issued the request forever. `EndpointStopped` is only for a transfer that
+   generated an event *instead of* completing.
+2. The Apple vendor handshake makes the iPhone re-enumerate with a fifth
+   (trusted) configuration. The exporter followed that silently under the live
+   session, so the host never learned its device changed. A re-enumeration is
+   now a disconnect and the importer rebuilds.
+3. Every URB was serialized behind one mutex held across the blocking ioctl,
+   so a bulk IN parked on the mux endpoint blocked the bulk OUT that would
+   have made the device answer.
+4. `IOUSBHostCIMessageTypeLink` (0x3c), the entry that chains one transfer
+   array to the next, was treated as unsupported, killing the session at the
+   first ring wrap (~480 transfers in).
+
+### Throughput
+
+Correct but latency-bound: one transfer in flight per endpoint, and this pair
+of machines has no direct route — tailscale falls back to `DERP(nyc)` at
+28-230ms RTT, so every USB round trip crosses the relay. That caps us near 30
+transfers/s and makes a lockdown read take ~110s. A direct route, or
+pipelining multiple URBs per endpoint (which needs per-endpoint completion
+ordering to stay stream-safe), is where the speed is.
