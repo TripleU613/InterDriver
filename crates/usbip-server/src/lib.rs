@@ -49,6 +49,15 @@ pub struct TransferCompletion {
 pub trait DeviceSession: Send + Sync + 'static {
     fn submit(&self, request: TransferRequest) -> TransferCompletion;
     fn cancel(&self, endpoint: u32);
+
+    /// The device backing this session is gone for good: it re-enumerated, was
+    /// unplugged, or reset into a different descriptor set. The server drops the
+    /// connection so the importer tears its virtual device down and re-imports,
+    /// which is what a physical re-enumeration looks like to a USB host. The
+    /// default is a session whose device never changes underneath it.
+    fn disconnected(&self) -> bool {
+        false
+    }
 }
 
 pub trait DeviceProvider: Send + Sync + 'static {
@@ -248,6 +257,11 @@ fn transfer_loop(mut reader: TcpStream, device: Arc<dyn DeviceSession>) -> io::R
                             .is_some();
                         if should_reply {
                             let _ = write_submit_reply(&writer, sequence, direction, completion);
+                        }
+                        if device.disconnected() {
+                            if let Ok(writer) = lock(&writer) {
+                                let _ = writer.shutdown(std::net::Shutdown::Both);
+                            }
                         }
                     })?;
             }

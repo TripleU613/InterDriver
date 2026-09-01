@@ -11,6 +11,7 @@ use std::io;
 use std::os::fd::{AsFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const USB_DEVICES: &str = "/sys/bus/usb/devices";
 const CONTROL_TIMEOUT_MS: u32 = 5_000;
@@ -91,6 +92,7 @@ impl DeviceProvider for UsbfsProvider {
                 claimed: opened.claimed,
                 configuration: opened.configuration,
             }),
+            gone: AtomicBool::new(false),
         }))
     }
 }
@@ -149,6 +151,7 @@ struct Inner {
 struct UsbfsDevice {
     bus_id: String,
     inner: Mutex<Inner>,
+    gone: AtomicBool,
 }
 
 impl DeviceSession for UsbfsDevice {
@@ -166,26 +169,13 @@ impl DeviceSession for UsbfsDevice {
     /// usbfs synchronous transfers cannot be interrupted once issued, so an
     /// unlink is answered by the server while the ioctl runs to completion.
     fn cancel(&self, _endpoint: u32) {}
+
+    fn disconnected(&self) -> bool {
+        self.gone.load(Ordering::Acquire)
+    }
 }
 
 impl UsbfsDevice {
-    /// The device vanished mid-session (a reset or erase during Configurator
-    /// prepare). Re-open it on the same physical port, following it to its new
-    /// device number, and re-claim its interfaces so the in-flight session
-    /// continues transparently.
-    fn reopen(&self, inner: &mut Inner) -> bool {
-        match open_node(&self.bus_id) {
-            Ok(opened) => {
-                inner.fd = opened.fd;
-                inner.claimed = opened.claimed;
-                inner.configuration = opened.configuration;
-                eprintln!("device {} re-enumerated; re-exported on the same port", self.bus_id);
-                true
-            }
-            Err(_) => false,
-        }
-    }
-
     fn control(&self, inner: &mut Inner, request: &TransferRequest) -> TransferCompletion {
         if let Some(outcome) = self.intercept(inner, request) {
             return completion(outcome, Vec::new(), Direction::Out);
@@ -199,14 +189,9 @@ impl UsbfsDevice {
             let copied = length.min(request.data.len());
             buffer[..copied].copy_from_slice(&request.data[..copied]);
         }
-        let mut outcome = run(inner, &mut buffer);
-        if is_device_gone(&outcome) && self.reopen(inner) {
-            buffer = vec![0_u8; length];
-            if request.direction == Direction::Out {
-                let copied = length.min(request.data.len());
-                buffer[..copied].copy_from_slice(&request.data[..copied]);
-            }
-            outcome = run(inner, &mut buffer);
+        let outcome = run(inner, &mut buffer);
+        if is_device_gone(&outcome) {
+            self.gone.store(true, Ordering::Release);
         }
         completion(outcome, buffer, request.direction)
     }
@@ -277,17 +262,16 @@ impl UsbfsDevice {
             }
         };
         let mut buffer = make_buffer();
-        let mut outcome = ioctl::bulk(inner.fd.as_fd(), endpoint, &mut buffer, TRANSFER_TIMEOUT_MS);
-        if is_device_gone(&outcome) && self.reopen(inner) {
-            buffer = make_buffer();
-            outcome = ioctl::bulk(inner.fd.as_fd(), endpoint, &mut buffer, TRANSFER_TIMEOUT_MS);
+        let outcome = ioctl::bulk(inner.fd.as_fd(), endpoint, &mut buffer, TRANSFER_TIMEOUT_MS);
+        if is_device_gone(&outcome) {
+            self.gone.store(true, Ordering::Release);
         }
         completion(outcome, buffer, request.direction)
     }
 }
 
-/// A transfer failed because the device is no longer there (ENODEV) — a reset
-/// or erase. That is the signal to re-open on the same port.
+/// A transfer failed because the device is no longer there (ENODEV): it reset,
+/// re-enumerated, or was unplugged. The session ends so the importer rebuilds.
 fn is_device_gone(outcome: &Outcome) -> bool {
     matches!(outcome, Outcome::Failed(status) if *status == ENODEV_STATUS)
 }
