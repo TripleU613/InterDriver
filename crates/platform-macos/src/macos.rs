@@ -1161,8 +1161,17 @@ impl MacController {
             let ep = key.endpoint;
             match &result {
                 Ok(c) => trace!(
-                    "FIN ep{ep:#04x} req={:02x?} st={} data={:02x?} len={}",
-                    sp, c.status, &c.data[..c.data.len().min(8)], c.actual_length
+                    "FIN ep{ep:#04x} req={:02x?} st={} data={:02x?} len={}/{}{}",
+                    sp,
+                    c.status,
+                    &c.data[..c.data.len().min(8)],
+                    c.actual_length,
+                    requested_length,
+                    if c.actual_length != requested_length && c.status == 0 {
+                        "  <-- SHORT"
+                    } else {
+                        ""
+                    }
                 ),
                 Err(e) => trace!("FIN ep{ep:#04x} req={:02x?} ERR {e:?}", sp),
             }
