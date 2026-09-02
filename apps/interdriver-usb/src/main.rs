@@ -611,15 +611,27 @@ fn linux_detach(_port: &str) -> Result<(), String> {
 fn windows_list() -> Result<(), String> {
     use interdriver_usbip_server::DeviceProvider as _;
 
-    let devices = interdriver_platform_windows::WinUsbProvider::new()
+    let driver_devices = interdriver_platform_windows::ExportDriverProvider::new()
         .list()
         .map_err(|error| error.to_string())?;
-    if devices.is_empty() {
-        println!("No WinUSB-bound devices found.");
+    let winusb_devices = interdriver_platform_windows::WinUsbProvider::new()
+        .list()
+        .map_err(|error| error.to_string())?;
+    if driver_devices.is_empty() && winusb_devices.is_empty() {
+        println!("No exportable devices found.");
     }
-    for description in devices {
+    for description in driver_devices {
         println!(
-            "{}\t{:04x}:{:04x}\tinterfaces={}",
+            "{}\t{:04x}:{:04x}\tdriver=kmdf\tinterfaces={}",
+            description.device.bus_id().unwrap_or("invalid"),
+            description.device.vendor_id,
+            description.device.product_id,
+            description.interfaces.len()
+        );
+    }
+    for description in winusb_devices {
+        println!(
+            "{}\t{:04x}:{:04x}\tdriver=winusb\tinterfaces={}",
             description.device.bus_id().unwrap_or("invalid"),
             description.device.vendor_id,
             description.device.product_id,
@@ -844,14 +856,27 @@ fn windows_detach() -> Result<(), String> {
 
 #[cfg(target_os = "windows")]
 fn windows_export(bus_id: &str, port: u16) -> Result<(), String> {
+    use interdriver_usbip_server::DeviceProvider as _;
     use std::net::TcpListener;
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
 
-    let provider = Arc::new(interdriver_platform_windows::WinUsbProvider::for_device(bus_id));
+    let driver = interdriver_platform_windows::ExportDriverProvider::for_device(bus_id);
+    let provider: Arc<dyn interdriver_usbip_server::DeviceProvider> = if driver
+        .list()
+        .map_err(|error| error.to_string())?
+        .is_empty()
+    {
+        Arc::new(interdriver_platform_windows::WinUsbProvider::for_device(bus_id))
+    } else {
+        driver
+            .monitor_reenumeration()
+            .map_err(|error| format!("start Windows mode-change monitor: {error}"))?;
+        Arc::new(driver)
+    };
     let listener =
         TcpListener::bind(("0.0.0.0", port)).map_err(|error| format!("bind {port}: {error}"))?;
-    eprintln!("exporting {bus_id} over WinUSB on port {port}; press Ctrl-C to stop");
+    eprintln!("exporting {bus_id} on port {port}; press Ctrl-C to stop");
     interdriver_usbip_server::serve(listener, provider, Arc::new(AtomicBool::new(false)))
         .map_err(|error| error.to_string())
 }

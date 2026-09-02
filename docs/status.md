@@ -516,33 +516,40 @@ transfers/s and makes a lockdown read take ~110s. A direct route, or
 pipelining multiple URBs per endpoint (which needs per-endpoint completion
 ordering to stay stream-safe), is where the speed is.
 
-## Windows iPhone export — blocked by WinUSB (2026-09-02)
+## Windows iPhone export — delivered (2026-09-02)
 
-An iPhone cannot be exported from Windows with the current WinUSB-based
-exporter. `winusb.sys` fails the device with `CM_PROB_FAILED_ADD` and problem
-status `0xc0000182` (`STATUS_DEVICE_CONFIGURATION_ERROR`) because it does not
-support devices advertising more than one USB configuration, and an iPhone
-advertises four or five.
+The custom KMDF parent driver in `driver/windows-export/` replaced WinUSB and
+was verified end to end on `win-test` with iPhone
+`00008030000E35002245802E`. The Windows CLI exports it over USB/IP and the Mac
+creates a real device under `AppleUSBUserHCI`:
 
-Ruled out along the way, on real hardware (`win-test`, iPhone `00008030000E35002245802E`):
+```
+$ cfgutil list
+Type: iPhone12,5  ECID: 0xE35002245802E
+UDID: 00008030-000E35002245802E  Location: 0x80100000  Name: iPhone
+$ cfgutil get name
+iPhone
+```
 
-- Not an INF or signing problem. The package installs and binds: the devnode
-  reports `service=WINUSB` with our INF and the InterDriver test certs are still
-  trusted, so the catalog validates.
-- Not a ranking problem. Apple's WHQL-signed `oem57.inf` outranks a test-signed
-  package whatever the DriverVer says, so `pnputil /add-driver /install` reports
-  "up-to-date" and changes nothing; `force_driver()` (UpdateDriverForPlugAndPlay
-  with INSTALLFLAG_FORCE) does replace it, and the failure persists.
-- Not a filter problem. No Lower/UpperFilters remained on the devnode or class.
-- Not a "single interface" problem. Binding the composite parent instead of
-  MI_01, replacing usbccgp so WinUSB owns the whole device, fails identically.
-- The in-box `winusb.inf` on this build has no `WINUSB.NT.Wdf` section; needing
-  it is an error, and `WINUSB.NT.HW` should be included. Both were corrected and
-  the device still fails.
+The driver owns the composite parent and exposes a bounded IOCTL surface for
+metadata, control, bulk/interrupt transfers, and cancellation. Configuration
+and alternate-interface selection use raw USB URBs because KMDF's high-level
+selector only selects the first configuration; this iPhone enters trusted
+configuration 5. Transfers use a parallel queue, and configuration changes
+abort and drain active pipe requests before replacing their handles.
 
-Exporting an iPhone from Windows needs a KMDF lower filter of our own on the
-device stack rather than WinUSB. Simple single-configuration devices are
-unaffected and still export (verified with a webcam).
+The Apple vendor trust handshake causes one same-PID re-enumeration. The stable
+bus ID follows the physical USB location, the server reports the old device as
+disconnected, and the macOS importer rebuilds it. The Windows exporter also
+remembers its published INF and re-applies it when the selected port appears as
+normal (`12a8`), recovery (`1281`), or DFU (`1227`).
 
-The box was returned to stock: all five of our driver packages removed and the
-phone back on Apple's drivers with every node reporting OK.
+Apple's signed package outranks a development-signed package, and an open Apple
+child function vetoes parent replacement. The installer therefore stops Apple
+Mobile Device Service and Bonjour, disables `MI_00`/`MI_01`, force-binds the
+parent, and leaves those services stopped while exporting.
+
+Normal-mode enumeration, the trust re-enumeration, Configurator discovery, and
+live usbmux traffic are verified. A destructive restore/recovery/DFU cycle has
+not been run on this phone. `cfgutil restart` could not perform the
+non-destructive lifecycle test because the pairing prompt had not been accepted.

@@ -2,8 +2,12 @@ use crate::ids::{bus_id_from_path, devnode_of, parse_hardware_id, parse_interfac
 use std::io;
 use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
     DIGCF_DEVICEINTERFACE, DIGCF_PRESENT, HDEVINFO, SP_DEVICE_INTERFACE_DATA,
+    SP_DEVINFO_DATA,
     SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInterfaces, SetupDiGetClassDevsW,
-    SetupDiGetDeviceInterfaceDetailW,
+    SetupDiGetDeviceInterfaceDetailW, SetupDiGetDevicePropertyW,
+};
+use windows_sys::Win32::Devices::Properties::{
+    DEVPKEY_Device_DriverInfPath, DEVPKEY_Device_LocationPaths, DEVPROPTYPE,
 };
 use windows_sys::core::GUID;
 
@@ -59,6 +63,12 @@ pub struct FoundDevice {
     pub class: &'static str,
 }
 
+pub struct DriverInterface {
+    pub path: String,
+    pub location_path: String,
+    pub inf_path: String,
+}
+
 struct DeviceInfoList(HDEVINFO);
 
 impl Drop for DeviceInfoList {
@@ -111,6 +121,55 @@ pub fn first_interface_path(guid: &GUID) -> io::Result<Option<String>> {
         return Ok(None);
     }
     interface_path(list.0, &mut interface)
+}
+
+pub fn list_driver_interfaces(guid: &GUID) -> io::Result<Vec<DriverInterface>> {
+    let handle = unsafe {
+        SetupDiGetClassDevsW(
+            guid,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            DIGCF_PRESENT | DIGCF_DEVICEINTERFACE,
+        )
+    };
+    if handle == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    let list = DeviceInfoList(handle);
+    let mut found = Vec::new();
+    let mut index = 0_u32;
+    loop {
+        let mut interface = SP_DEVICE_INTERFACE_DATA {
+            cbSize: size_of::<SP_DEVICE_INTERFACE_DATA>() as u32,
+            InterfaceClassGuid: *guid,
+            Flags: 0,
+            Reserved: 0,
+        };
+        let ok = unsafe {
+            SetupDiEnumDeviceInterfaces(
+                list.0,
+                std::ptr::null(),
+                guid,
+                index,
+                &mut interface,
+            )
+        };
+        if ok == 0 {
+            break;
+        }
+        index += 1;
+        let Some((path, device)) = interface_path_with_device(list.0, &mut interface)? else {
+            continue;
+        };
+        let location_path = device_location_path(list.0, &device)?.unwrap_or_else(|| path.clone());
+        let inf_path = device_driver_inf_path(list.0, &device)?.unwrap_or_default();
+        found.push(DriverInterface {
+            path,
+            location_path,
+            inf_path,
+        });
+    }
+    Ok(found)
 }
 
 fn list_by_class(class: &'static str, guid: &GUID) -> io::Result<Vec<FoundDevice>> {
@@ -205,4 +264,133 @@ fn interface_path(
         std::slice::from_raw_parts(buffer.as_ptr().cast::<u8>(), buffer.len() * size_of::<u32>())
     };
     Ok(Some(crate::ids::wide_string_at(&bytes[size_of::<u32>()..])))
+}
+
+fn interface_path_with_device(
+    list: HDEVINFO,
+    interface: *mut SP_DEVICE_INTERFACE_DATA,
+) -> io::Result<Option<(String, SP_DEVINFO_DATA)>> {
+    let mut required = 0_u32;
+    unsafe {
+        SetupDiGetDeviceInterfaceDetailW(
+            list,
+            interface,
+            std::ptr::null_mut(),
+            0,
+            &mut required,
+            std::ptr::null_mut(),
+        )
+    };
+    if required == 0 {
+        return Ok(None);
+    }
+    let words = (required as usize).div_ceil(size_of::<u32>()) + 1;
+    let mut buffer = vec![0_u32; words];
+    buffer[0] = if cfg!(target_pointer_width = "64") { 8 } else { 6 };
+    let mut device = SP_DEVINFO_DATA {
+        cbSize: size_of::<SP_DEVINFO_DATA>() as u32,
+        ClassGuid: GUID::from_u128(0),
+        DevInst: 0,
+        Reserved: 0,
+    };
+    let ok = unsafe {
+        SetupDiGetDeviceInterfaceDetailW(
+            list,
+            interface,
+            buffer.as_mut_ptr().cast(),
+            required,
+            std::ptr::null_mut(),
+            &mut device,
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(buffer.as_ptr().cast::<u8>(), buffer.len() * size_of::<u32>())
+    };
+    Ok(Some((
+        crate::ids::wide_string_at(&bytes[size_of::<u32>()..]),
+        device,
+    )))
+}
+
+fn device_location_path(
+    list: HDEVINFO,
+    device: &SP_DEVINFO_DATA,
+) -> io::Result<Option<String>> {
+    let mut required = 0_u32;
+    let mut property_type: DEVPROPTYPE = 0;
+    unsafe {
+        SetupDiGetDevicePropertyW(
+            list,
+            device,
+            &DEVPKEY_Device_LocationPaths,
+            &mut property_type,
+            std::ptr::null_mut(),
+            0,
+            &mut required,
+            0,
+        )
+    };
+    if required == 0 {
+        return Ok(None);
+    }
+    let mut buffer = vec![0_u8; required as usize];
+    let ok = unsafe {
+        SetupDiGetDevicePropertyW(
+            list,
+            device,
+            &DEVPKEY_Device_LocationPaths,
+            &mut property_type,
+            buffer.as_mut_ptr(),
+            buffer.len() as u32,
+            &mut required,
+            0,
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(Some(crate::ids::wide_string_at(&buffer)))
+}
+
+fn device_driver_inf_path(
+    list: HDEVINFO,
+    device: &SP_DEVINFO_DATA,
+) -> io::Result<Option<String>> {
+    let mut required = 0_u32;
+    let mut property_type: DEVPROPTYPE = 0;
+    unsafe {
+        SetupDiGetDevicePropertyW(
+            list,
+            device,
+            &DEVPKEY_Device_DriverInfPath,
+            &mut property_type,
+            std::ptr::null_mut(),
+            0,
+            &mut required,
+            0,
+        )
+    };
+    if required == 0 {
+        return Ok(None);
+    }
+    let mut buffer = vec![0_u8; required as usize];
+    let ok = unsafe {
+        SetupDiGetDevicePropertyW(
+            list,
+            device,
+            &DEVPKEY_Device_DriverInfPath,
+            &mut property_type,
+            buffer.as_mut_ptr(),
+            buffer.len() as u32,
+            &mut required,
+            0,
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(Some(crate::ids::wide_string_at(&buffer)))
 }

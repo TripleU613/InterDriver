@@ -1,0 +1,59 @@
+;
+; Exclusive InterDriver USB exporter for Apple mobile-device modes.
+;
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = USBDevice
+ClassGuid   = {88bae032-5a81-49f0-bc3d-a4ff138216d6}
+Provider    = %ManufacturerName%
+CatalogFile = interdriver-export.cat
+DriverVer   = 09/02/2026,1.0.4.0
+PnpLockdown = 1
+
+[DestinationDirs]
+DefaultDestDir = 13
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[SourceDisksFiles]
+interdriver-export.sys = 1,,
+
+[Manufacturer]
+%ManufacturerName% = Standard,NTamd64
+
+[Standard.NTamd64]
+%DeviceName.Normal%   = GtExport_Device, USB\VID_05AC&PID_12A8
+%DeviceName.Recovery% = GtExport_Device, USB\VID_05AC&PID_1281
+%DeviceName.Dfu%      = GtExport_Device, USB\VID_05AC&PID_1227
+
+[GtExport_Device.NT]
+CopyFiles = Drivers_Dir
+
+[Drivers_Dir]
+interdriver-export.sys
+
+[GtExport_Device.NT.Services]
+AddService = interdriver_export,0x00000002,GtExport_Service
+
+[GtExport_Service]
+DisplayName   = %ServiceName%
+ServiceType   = 1
+StartType     = 3
+ErrorControl  = 1
+ServiceBinary = %13%\interdriver-export.sys
+
+[GtExport_Device.NT.Wdf]
+KmdfService = interdriver_export,GtExport_Wdf
+
+[GtExport_Wdf]
+KmdfLibraryVersion = 1.33
+
+[Strings]
+ManufacturerName    = "InterDriver"
+DiskName            = "InterDriver USB Exporter Installation Disk"
+DeviceName.Normal   = "InterDriver USB Exporter (Apple Mobile Device)"
+DeviceName.Recovery = "InterDriver USB Exporter (Apple Recovery Device)"
+DeviceName.Dfu      = "InterDriver USB Exporter (Apple DFU Device)"
+ServiceName         = "InterDriver Physical USB Exporter"

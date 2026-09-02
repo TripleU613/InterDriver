@@ -22,23 +22,15 @@ Every direction is implemented and has been run on real hardware.
 | --- | --- | --- | --- |
 | **Linux** | yes | yes | yes |
 | **macOS** | yes | yes | yes |
-| **Windows** | yes\* | yes\* | yes\* |
+| **Windows** | yes | yes | yes |
 
 Proven end to end: Apple Configurator on a MacBook driving an iPhone physically
-attached to a Linux box — `cfgutil list` returns the real ECID and UDID, and a
-full iOS restore ran to completion over the link.
-
-\* **Exporting from Windows does not work for iPhones.** The Windows exporter is
-built on WinUSB, and `winusb.sys` refuses any device that advertises more than
-one USB configuration — it fails the device with `CM_PROB_FAILED_ADD` and
-`STATUS_DEVICE_CONFIGURATION_ERROR (0xc0000182)`. An iPhone advertises four or
-five. This is a WinUSB limitation, not an INF problem: binding it to the
-composite parent instead of a single interface fails the same way. Simple
-single-configuration devices export from Windows fine (verified with a webcam).
-
-To export an iPhone from Windows the exporter needs its own KMDF lower filter on
-the device stack instead of WinUSB. That is not written yet. Until it is, put the
-iPhone on the Linux box — that path is complete and proven.
+attached to either Linux or Windows. On Windows, the custom KMDF exporter owns
+the Apple USB parent, supports all five configurations, and carries the trust
+handshake and usbmux traffic. `cfgutil list` returns the real ECID and UDID and
+`cfgutil get name` returns the phone's name. A full iOS restore has run over the
+Linux path; the Windows path has been exercised through Configurator but not a
+destructive restore.
 
 ---
 
@@ -64,9 +56,9 @@ gets carried — if the device reboots or re-enumerates, the link follows it.
 This is the hardest path in the project. Follow it in order; the two steps people
 lose a day to are marked **← this one**.
 
-> **Read this first:** this guide gets you a WinUSB-bound device. It works for
-> ordinary USB devices. It does **not** work for an iPhone — see the note on the
-> matrix above. For iPhone-to-Configurator today, export from Linux.
+> **Read this first:** exporting an iPhone takes exclusive ownership of its USB
+> parent. iTunes and Apple Devices on the Windows host cannot use the phone at
+> the same time.
 
 ### 1. Windows: find the device
 
@@ -74,34 +66,33 @@ lose a day to are marked **← this one**.
 interdriver-usb windows list
 ```
 
-Nothing listed? That is expected before the next step — Windows only shows
-devices bound to WinUSB here, and an iPhone ships bound to Apple's driver.
+Nothing listed? That is expected before the next step. An iPhone ships bound to
+Apple's driver.
 
-### 2. Windows: bind the interface to WinUSB, then **reboot** ← this one
+### 2. Windows: build, sign, and bind the exporter driver ← this one
 
-The exporter opens the device through WinUSB, so the interface must be bound to
-it. For an iPhone that means the `MI_01` interface (Apple USB Multiplexor).
+Build and stage the driver package on Linux:
 
-```powershell
-interdriver-usb windows install-driver C:\path\to\winusb.inf
+```bash
+./driver/windows-export/build.sh
+./driver/windows-export/package.sh
 ```
 
-Windows ranks an inbox or WHQL-signed driver above a test-signed one whatever the
-version says, so a plain install will be told "driver package is up-to-date" and
-change nothing. Force it:
+Sign the staged INF, SYS, and catalog with a trusted development certificate.
+The test machine must have test signing enabled. Copy the package to Windows,
+then use an elevated PowerShell window:
 
 ```powershell
-interdriver-usb windows force-driver "USB\VID_xxxx&PID_yyyy&MI_01" C:\path\to\winusb.inf
+Set-ExecutionPolicy -Scope Process Bypass
+.\install.ps1
 ```
 
-**Reboot before you try anything else.** A forced driver swap leaves Windows in a
-"reboot pending" state, and until you reboot, `CreateFileW` on the interface
-fails with `ERROR_NOT_SUPPORTED (50)` and nothing you do to the code will help.
-
-After the reboot, `interdriver-usb windows list` shows the device and its bus id.
-
-To undo it later: Device Manager → the `MI_01` device → Uninstall device, tick
-*delete driver*, then Scan for hardware changes. Apple's driver comes back.
+The script stops the Apple services, disables their open composite functions,
+forces the KMDF driver onto the physical parent, and creates the inbound
+firewall rule. `interdriver-usb windows list` then prints a stable `win-...` bus id.
+Keep the Apple services stopped while exporting. To restore local Apple access,
+uninstall the InterDriver parent driver in Device Manager, scan for hardware
+changes, re-enable the Apple functions, and start the two services.
 
 ### 3. Windows: export it
 
@@ -179,7 +170,9 @@ no `usbipd`. Needs root for `/dev/bus/usb`. Find the port with
 **macOS (import)** — entitlement, or the SIP-off bypass above. This is the only
 platform with a hard gate.
 
-**Windows (export)** — WinUSB-bound interface plus a reboot after binding.
+**Windows (export)** — custom KMDF parent driver in
+`driver/windows-export/`. Development builds require test signing. Ordinary
+single-configuration devices can still use the WinUSB exporter.
 
 **Windows (import)** — the UdeCx virtual host controller driver in
 `driver/windows-ude/`. Test-signed builds need `bcdedit /set testsigning on`.
@@ -222,8 +215,10 @@ credentials.
 **Mac process exits immediately, code 137** — AMFI killed it. You skipped the
 ad-hoc `codesign`, or `amfi_get_out_of_my_way` is not set.
 
-**Windows `CreateFileW` fails with ERROR_NOT_SUPPORTED (50)** — you have not
-rebooted since binding WinUSB.
+**Windows phone disappears during driver binding** — stop Apple Mobile Device
+Service and Bonjour and disable the phone's `MI_00`/`MI_01` child devnodes, or
+use `driver/windows-export/install.ps1`. An open Apple function vetoes the
+exclusive parent replacement.
 
 **Device shows in `ioreg` but `cfgutil list` is empty** — enumerated but not
 configured. Run the Mac side with `INTERDRIVER_TRACE=1` and look for
@@ -275,10 +270,11 @@ crates/usbip-server/    exporter side (DeviceProvider / DeviceSession)
 crates/usbfs-linux/     Linux exporter, usbfs ioctls
 crates/platform-linux/  Linux importer, kernel vhci
 crates/platform-macos/  macOS importer, IOUSBHostControllerInterface
-crates/platform-windows/ Windows exporter (WinUSB) and importer (UdeCx)
+crates/platform-windows/ Windows exporters (KMDF/WinUSB) and importer (UdeCx)
 crates/control-plane/   broker, tickets, revocation
 crates/tls/             mTLS for both planes
 driver/windows-ude/     the Windows virtual host controller driver
+driver/windows-export/  the Windows physical USB exporter driver
 docs/                   architecture, status, platform notes
 ```
 
