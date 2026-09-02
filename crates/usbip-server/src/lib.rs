@@ -5,7 +5,7 @@ use interdriver_usbip_protocol::{TICKET_LEN, TICKET_MAGIC,
     IsoPacketDescriptor, OP_REP_DEVLIST, OP_REP_IMPORT, OP_REQ_DEVLIST, OP_REQ_IMPORT, Submit,
     SubmitReply, URB_HEADER_LEN, UrbHeader,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -226,29 +226,35 @@ fn import_device(mut stream: TcpStream, provider: Arc<dyn DeviceProvider>) -> io
     )?;
     stream.write_all(&description.device.encode())?;
     stream.flush()?;
-    watch_for_disconnect(&stream, Arc::clone(&device))?;
-    transfer_loop(stream, device)
+    let watchdog_done = watch_for_disconnect(&stream, Arc::clone(&device))?;
+    let result = transfer_loop(stream, device);
+    watchdog_done.store(true, Ordering::Release);
+    result
 }
 
 /// Ends the connection when the device goes away, even with nothing in flight.
 /// A device is not only lost through a failed transfer: while the importing host
 /// waits for a rebooting device there is no traffic to fail, so without this the
 /// session would sit on a device that is already gone.
-fn watch_for_disconnect(stream: &TcpStream, device: Arc<dyn DeviceSession>) -> io::Result<()> {
+fn watch_for_disconnect(
+    stream: &TcpStream,
+    device: Arc<dyn DeviceSession>,
+) -> io::Result<Arc<AtomicBool>> {
     let stream = stream.try_clone()?;
+    let done = Arc::new(AtomicBool::new(false));
+    let thread_done = Arc::clone(&done);
     thread::Builder::new()
         .name("interdriver-usbip-watchdog".into())
         .spawn(move || {
-            while !device.disconnected() {
+            while !thread_done.load(Ordering::Acquire) && !device.disconnected() {
                 thread::sleep(DISCONNECT_POLL);
-                // The connection closing is the other way this thread retires.
-                if stream.peer_addr().is_err() {
-                    return;
-                }
+            }
+            if thread_done.load(Ordering::Acquire) {
+                return;
             }
             let _ = stream.shutdown(std::net::Shutdown::Both);
         })?;
-    Ok(())
+    Ok(done)
 }
 
 struct Pending {
@@ -258,18 +264,45 @@ struct Pending {
 fn transfer_loop(mut reader: TcpStream, device: Arc<dyn DeviceSession>) -> io::Result<()> {
     let writer = Arc::new(Mutex::new(reader.try_clone()?));
     let pending = Arc::new(Mutex::new(HashMap::<u32, Pending>::new()));
+    let result = transfer_loop_inner(&mut reader, &device, &writer, &pending);
+
+    // A dead USB/IP connection cannot deliver completions for its outstanding
+    // transfers. Abort every endpoint still owned by this connection so those
+    // backend requests cannot survive into the next import and consume data
+    // meant for the replacement session (notably usbmux's one-shot reply).
+    let endpoints = lock(&pending)
+        .map(|mut pending| {
+            pending
+                .drain()
+                .map(|(_, request)| request.endpoint)
+                .collect::<HashSet<_>>()
+        })
+        .unwrap_or_default();
+    for endpoint in endpoints {
+        device.cancel(endpoint);
+    }
+
+    result
+}
+
+fn transfer_loop_inner(
+    reader: &mut TcpStream,
+    device: &Arc<dyn DeviceSession>,
+    writer: &Arc<Mutex<TcpStream>>,
+    pending: &Arc<Mutex<HashMap<u32, Pending>>>,
+) -> io::Result<()> {
     loop {
         let mut bytes = [0; URB_HEADER_LEN];
         reader.read_exact(&mut bytes)?;
         match UrbHeader::decode(&bytes).map_err(protocol_error)? {
             UrbHeader::Submit(submit) => {
-                let request = read_submit_request(&mut reader, submit)?;
+                let request = read_submit_request(reader, submit)?;
                 let sequence = request.sequence;
                 let endpoint = request.endpoint;
-                lock(&pending)?.insert(sequence, Pending { endpoint });
-                let device = Arc::clone(&device);
-                let writer = Arc::clone(&writer);
-                let pending = Arc::clone(&pending);
+                lock(pending)?.insert(sequence, Pending { endpoint });
+                let device = Arc::clone(device);
+                let writer = Arc::clone(writer);
+                let pending = Arc::clone(pending);
                 thread::Builder::new()
                     .name(format!("interdriver-usbip-urb-{sequence}"))
                     .spawn(move || {
@@ -282,15 +315,15 @@ fn transfer_loop(mut reader: TcpStream, device: Arc<dyn DeviceSession>) -> io::R
                         if should_reply {
                             let _ = write_submit_reply(&writer, sequence, direction, completion);
                         }
-                        if device.disconnected() {
-                            if let Ok(writer) = lock(&writer) {
-                                let _ = writer.shutdown(std::net::Shutdown::Both);
-                            }
+                        if device.disconnected()
+                            && let Ok(writer) = lock(&writer)
+                        {
+                            let _ = writer.shutdown(std::net::Shutdown::Both);
                         }
                     })?;
             }
             UrbHeader::Unlink(unlink) => {
-                let removed = lock(&pending)?.remove(&unlink.target_sequence);
+                let removed = lock(pending)?.remove(&unlink.target_sequence);
                 let status = if let Some(pending) = removed {
                     device.cancel(pending.endpoint);
                     -104
@@ -307,7 +340,7 @@ fn transfer_loop(mut reader: TcpStream, device: Arc<dyn DeviceSession>) -> io::R
                     },
                     status,
                 });
-                let mut writer = lock(&writer)?;
+                let mut writer = lock(writer)?;
                 writer.write_all(&reply.encode())?;
                 writer.flush()?;
             }
@@ -464,11 +497,15 @@ mod tests {
     struct TestDevice {
         canceled: Mutex<bool>,
         cancel_changed: Condvar,
+        blocking_started: Mutex<bool>,
+        blocking_changed: Condvar,
     }
 
     impl DeviceSession for TestDevice {
         fn submit(&self, request: TransferRequest) -> TransferCompletion {
             if request.endpoint == 9 {
+                *self.blocking_started.lock().unwrap() = true;
+                self.blocking_changed.notify_all();
                 let mut canceled = self.canceled.lock().unwrap();
                 while !*canceled {
                     canceled = self.cancel_changed.wait(canceled).unwrap();
@@ -595,5 +632,36 @@ mod tests {
         );
         drop(session);
         server.join().unwrap();
+    }
+
+    #[test]
+    fn disconnect_cancels_pending_backend_transfers() {
+        let provider = provider();
+        let device = Arc::clone(&provider.session);
+        let (address, server) = one_connection(provider);
+        let session =
+            interdriver_usbip_session::Session::connect(address, "1-2", Duration::from_secs(1))
+                .unwrap();
+        let _pending = session
+            .submit(interdriver_usbip_session::TransferRequest::input(9, 64))
+            .unwrap();
+
+        let mut started = device.blocking_started.lock().unwrap();
+        while !*started {
+            let (next, timeout) = device
+                .blocking_changed
+                .wait_timeout(started, Duration::from_secs(1))
+                .unwrap();
+            started = next;
+            assert!(!timeout.timed_out(), "backend transfer did not start");
+        }
+        drop(started);
+
+        drop(session);
+        server.join().unwrap();
+        assert!(
+            *device.canceled.lock().unwrap(),
+            "connection teardown must cancel the pending endpoint"
+        );
     }
 }
