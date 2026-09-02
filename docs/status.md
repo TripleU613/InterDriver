@@ -518,8 +518,8 @@ ordering to stay stream-safe), is where the speed is.
 
 ## Windows iPhone export — delivered (2026-09-02)
 
-The custom KMDF parent driver in `driver/windows-export/` replaced WinUSB and
-was verified end to end on `win-test` with iPhone
+The Rust KMDF parent driver in `driver/windows-export-rs/` replaced WinUSB and
+was verified against the C 1.0.4 reference on `win-test` with iPhone
 `00008030000E35002245802E`. The Windows CLI exports it over USB/IP and the Mac
 creates a real device under `AppleUSBUserHCI`:
 
@@ -537,6 +537,13 @@ and alternate-interface selection use raw USB URBs because KMDF's high-level
 selector only selects the first configuration; this iPhone enters trusted
 configuration 5. Transfers use a parallel queue, and configuration changes
 abort and drain active pipe requests before replacing their handles.
+
+The Rust port must explicitly set the parallel queue's
+`NumberOfPresentedRequests` to `ULONG_MAX`; the C `WDF_IO_QUEUE_CONFIG_INIT`
+macro does this implicitly. Leaving the zero-initialized value in Rust creates
+a queue that accepts requests but never presents one to the callback. Mutable
+pipe state is isolated behind the KMDF wait lock so parallel callbacks do not
+create aliased Rust references.
 
 The Apple vendor trust handshake causes one same-PID re-enumeration. The stable
 bus ID follows the physical USB location, the server reports the old device as

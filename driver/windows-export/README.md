@@ -12,12 +12,18 @@ This is a test-signed development driver. Bind it to the composite parent, not
 to `MI_00` or `MI_01`. Binding removes the local Apple functions until the stock
 driver is restored.
 
-Build the driver and stage it with the Windows CLI:
+Build both implementations, or select one explicitly:
 
 ```bash
-./driver/windows-export/build.sh
-./driver/windows-export/package.sh
+cargo xtask windows-export build
+cargo xtask windows-export package rust
+cargo xtask windows-export package reference
 ```
+
+The Cargo-driven `xtask` is the only build, packaging, signing, and install
+entry point. The Rust KMDF package is staged under `package/rust`; the proven C
+1.0.4 package remains under `package/reference` as a rollback during the Rust
+hardware soak.
 
 On a disposable Windows development machine, enable test signing once and
 reboot:
@@ -27,19 +33,18 @@ bcdedit /set testsigning on
 Restart-Computer
 ```
 
-Then copy the staged `package` directory to Windows and run this from an
-elevated PowerShell window:
+Then copy one staged package directory to Windows and run this from an elevated
+terminal:
 
-```powershell
-Set-ExecutionPolicy -Scope Process Bypass
-.\sign-test.ps1
-.\install.ps1
+```text
+interdriver-driver-tool.exe windows-export sign-test .
+interdriver-driver-tool.exe windows-export install .
 interdriver-usb.exe windows export <bus-id> 3240
 ```
 
-`sign-test.ps1` creates a local development certificate and trusts it on that
-machine. It is not release signing. A distributed driver still needs Microsoft's
-production driver-signing process.
+The signing command creates a local development certificate and trusts it on
+that machine. It is not release signing. A distributed driver still needs
+Microsoft's production driver-signing process.
 
 The installer stops Apple Mobile Device Service and Bonjour, disables the
 Apple composite child functions, binds the physical parent, and opens TCP 3240

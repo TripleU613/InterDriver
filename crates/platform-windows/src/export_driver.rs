@@ -3,6 +3,9 @@ use interdriver_usbip_protocol::{DeviceRecord, Direction};
 use interdriver_usbip_server::{
     DeviceDescription, DeviceProvider, DeviceSession, TransferCompletion, TransferRequest,
 };
+use interdriver_windows_export_abi::{
+    IOCTL_ABORT_ENDPOINT, IOCTL_GET_INFO, IOCTL_TRANSFER, MAX_TRANSFER, PROTOCOL_VERSION,
+};
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::io;
@@ -18,22 +21,8 @@ use windows_sys::core::GUID;
 
 const GENERIC_READ: u32 = 0x8000_0000;
 const GENERIC_WRITE: u32 = 0x4000_0000;
-const DEVICE_TYPE: u32 = 0x8124;
-const METHOD_BUFFERED: u32 = 0;
-const FILE_READ_ACCESS: u32 = 1;
-const FILE_WRITE_ACCESS: u32 = 2;
 const INFO_LEN: usize = 36;
 const TRANSFER_HEADER_LEN: usize = 36;
-const MAX_TRANSFER: usize = 1024 * 1024;
-const PROTOCOL_VERSION: u32 = 1;
-
-const fn ctl_code(function: u32, access: u32) -> u32 {
-    (DEVICE_TYPE << 16) | (access << 14) | (function << 2) | METHOD_BUFFERED
-}
-
-const IOCTL_GET_INFO: u32 = ctl_code(0x800, FILE_READ_ACCESS);
-const IOCTL_TRANSFER: u32 = ctl_code(0x801, FILE_READ_ACCESS | FILE_WRITE_ACCESS);
-const IOCTL_ABORT_ENDPOINT: u32 = ctl_code(0x802, FILE_WRITE_ACCESS);
 
 const STATUS_IO_TIMEOUT: u32 = 0xc000_00b5;
 const STATUS_DEVICE_NOT_CONNECTED: u32 = 0xc000_009d;

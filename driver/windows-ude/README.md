@@ -19,18 +19,21 @@ Cross-compiled from Linux with clang-cl and lld-link against WDK/SDK headers
 unpacked from NuGet packages:
 
 ```sh
-bash driver/windows-ude/build.sh      # -> build/interdriver-ude.sys
+cargo xtask windows-ude build         # -> driver/windows-ude/build/interdriver-ude.sys
+cargo xtask windows-ude package       # -> driver/windows-ude/package/
 ```
 
-`scripts/fetch-wdk.sh` downloads and prepares `.wdk/` (about 1.2 GB, gitignored).
+`cargo xtask wdk fetch` downloads and prepares `.wdk/` (about 1.2 GB,
+gitignored).
 
 Two things make the cross-build work:
 
 - The WDK ships kernel CRT headers under `Include/<ver>/km/crt`, which supply
   `excpt.h` and friends that MSVC would otherwise provide.
 - WDK and SDK headers `#include` each other with inconsistent capitalisation,
-  which Windows tolerates and Linux does not. `fetch-wdk.sh` scans every header
-  for unresolved same-directory includes and adds case-variant symlinks.
+  which Windows tolerates and Linux does not. `cargo xtask wdk fetch` scans
+  every header for unresolved same-directory includes and adds case-variant
+  symlinks.
 
 KMDF version directories are incremental, so both the target version and an
 older complete one are on the include path.
@@ -38,7 +41,8 @@ older complete one are on the include path.
 ## PE requirements the kernel enforces
 
 Getting a cross-built image to load took matching several fields MSVC sets and
-lld-link does not by default. All are in `build.sh`; the decisive one is last:
+lld-link does not by default. The Rust xtask supplies all of them; the decisive
+one is last:
 
 | flag | why |
 | --- | --- |

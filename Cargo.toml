@@ -13,7 +13,10 @@ members = [
     "crates/control-plane",
     "crates/gadget-linux",
     "crates/tls",
+    "crates/windows-export-abi",
+    "xtask",
 ]
+exclude = ["driver/windows-export-rs"]
 resolver = "3"
 
 [workspace.package]

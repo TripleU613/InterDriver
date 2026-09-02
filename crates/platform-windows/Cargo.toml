@@ -7,6 +7,7 @@ publish.workspace = true
 [target.'cfg(target_os = "windows")'.dependencies]
 interdriver-usbip-protocol = { path = "../usbip-protocol" }
 interdriver-usbip-server = { path = "../usbip-server" }
+interdriver-windows-export-abi = { path = "../windows-export-abi" }
 
 [target.'cfg(target_os = "windows")'.dependencies.windows-sys]
 version = "0.61"

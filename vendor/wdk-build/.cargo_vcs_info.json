@@ -1,0 +1,6 @@
+{
+  "git": {
+    "sha1": "361244d5c5bda5b2abb1e926321fb1864dc910be"
+  },
+  "path_in_vcs": "crates/wdk-build"
+}

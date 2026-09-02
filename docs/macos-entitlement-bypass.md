@@ -67,10 +67,11 @@ approving engineer turns them around quickly.
 
 ## One command once SIP is off
 
-`scripts/macos-import-enable.sh` signs the controller probe with the entitlement,
-prints the machine's security posture, runs it, and interprets the result. On a
-Full Security machine it reports the AMFI kill and the exact Recovery steps; with
-SIP disabled it reports whether the controller was created.
+`cargo xtask macos enable-import` signs the controller probe with the
+entitlement, prints the machine's security posture, runs it, and interprets the
+result. Pass a binary path after `enable-import` to test a different build. On a
+Full Security machine it reports the AMFI kill and the exact Recovery steps;
+with SIP disabled it reports whether the controller was created.
 
 ## Two ways forward
 

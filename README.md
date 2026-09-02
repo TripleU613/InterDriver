@@ -74,20 +74,19 @@ Apple's driver.
 Build and stage the driver package on Linux:
 
 ```bash
-./driver/windows-export/build.sh
-./driver/windows-export/package.sh
+cargo xtask windows-export package rust
 ```
 
 Sign the staged INF, SYS, and catalog with a trusted development certificate.
-The test machine must have test signing enabled. Copy the package to Windows,
-then use an elevated PowerShell window:
+The test machine must have test signing enabled. Copy `package/rust` to
+Windows, then use an elevated terminal:
 
-```powershell
-Set-ExecutionPolicy -Scope Process Bypass
-.\install.ps1
+```text
+interdriver-driver-tool.exe windows-export sign-test .
+interdriver-driver-tool.exe windows-export install .
 ```
 
-The script stops the Apple services, disables their open composite functions,
+The Rust tool stops the Apple services, disables their open composite functions,
 forces the KMDF driver onto the physical parent, and creates the inbound
 firewall rule. `interdriver-usb windows list` then prints a stable `win-...` bus id.
 Keep the Apple services stopped while exporting. To restore local Apple access,
@@ -170,9 +169,10 @@ no `usbipd`. Needs root for `/dev/bus/usb`. Find the port with
 **macOS (import)** — entitlement, or the SIP-off bypass above. This is the only
 platform with a hard gate.
 
-**Windows (export)** — custom KMDF parent driver in
-`driver/windows-export/`. Development builds require test signing. Ordinary
-single-configuration devices can still use the WinUSB exporter.
+**Windows (export)** — Rust KMDF parent driver in
+`driver/windows-export-rs/`, with the C 1.0.4 implementation retained as the
+hardware-tested rollback reference. Development builds require test signing.
+Ordinary single-configuration devices can still use the WinUSB exporter.
 
 **Windows (import)** — the UdeCx virtual host controller driver in
 `driver/windows-ude/`. Test-signed builds need `bcdedit /set testsigning on`.
@@ -215,10 +215,11 @@ credentials.
 **Mac process exits immediately, code 137** — AMFI killed it. You skipped the
 ad-hoc `codesign`, or `amfi_get_out_of_my_way` is not set.
 
-**Windows phone disappears during driver binding** — stop Apple Mobile Device
-Service and Bonjour and disable the phone's `MI_00`/`MI_01` child devnodes, or
-use `driver/windows-export/install.ps1`. An open Apple function vetoes the
-exclusive parent replacement.
+**Windows phone disappears during driver binding** — run
+`interdriver-driver-tool.exe windows-export install .` from the staged package. It
+stops Apple Mobile Device Service and Bonjour and disables the phone's
+`MI_00`/`MI_01` child devnodes. An open Apple function vetoes the exclusive
+parent replacement.
 
 **Device shows in `ioreg` but `cfgutil list` is empty** — enumerated but not
 configured. Run the Mac side with `INTERDRIVER_TRACE=1` and look for
@@ -274,7 +275,9 @@ crates/platform-windows/ Windows exporters (KMDF/WinUSB) and importer (UdeCx)
 crates/control-plane/   broker, tickets, revocation
 crates/tls/             mTLS for both planes
 driver/windows-ude/     the Windows virtual host controller driver
-driver/windows-export/  the Windows physical USB exporter driver
+driver/windows-export/  C 1.0.4 Windows exporter reference and package output
+driver/windows-export-rs/ Rust Windows physical USB exporter driver
+xtask/                   Cargo-driven Windows driver automation
 docs/                   architecture, status, platform notes
 ```
 

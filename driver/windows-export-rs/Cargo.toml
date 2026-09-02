@@ -1,0 +1,35 @@
+[package]
+name = "interdriver-export-driver"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[package.metadata.wdk.driver-model]
+driver-type = "KMDF"
+kmdf-version-major = 1
+target-kmdf-version-minor = 33
+
+[lib]
+crate-type = ["cdylib"]
+name = "interdriver_export"
+
+[dependencies]
+interdriver-windows-export-abi = { path = "../../crates/windows-export-abi" }
+wdk = "0.4.1"
+wdk-panic = "0.4.1"
+wdk-sys = { version = "0.5.1", features = ["usb"] }
+
+[build-dependencies]
+wdk-build = "0.5.1"
+
+[workspace]
+
+[patch.crates-io]
+wdk-build = { path = "../../vendor/wdk-build" }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+lto = true
