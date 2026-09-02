@@ -6,7 +6,7 @@ use interdriver_usbip_server::{
 use interdriver_windows_export_abi::{
     IOCTL_ABORT_ENDPOINT, IOCTL_GET_INFO, IOCTL_TRANSFER, MAX_TRANSFER, PROTOCOL_VERSION,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::io;
 use std::os::windows::ffi::OsStrExt;
@@ -53,18 +53,23 @@ struct DeviceInfo {
 
 pub struct ExportDriverProvider {
     exported: Option<String>,
+    active: Arc<Mutex<HashSet<String>>>,
 }
 
 impl ExportDriverProvider {
     #[must_use]
-    pub const fn new() -> Self {
-        Self { exported: None }
+    pub fn new() -> Self {
+        Self {
+            exported: None,
+            active: Arc::new(Mutex::new(HashSet::new())),
+        }
     }
 
     #[must_use]
     pub fn for_device(bus_id: &str) -> Self {
         Self {
             exported: Some(bus_id.to_owned()),
+            active: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -72,6 +77,23 @@ impl ExportDriverProvider {
         self.exported
             .as_ref()
             .is_none_or(|allowed| allowed == bus_id)
+    }
+
+    fn claim(&self, bus_id: &str) -> io::Result<DeviceClaim> {
+        let mut active = self
+            .active
+            .lock()
+            .map_err(|_| io::Error::other("exporter device claim lock poisoned"))?;
+        if !active.insert(bus_id.to_owned()) {
+            return Err(io::Error::new(
+                io::ErrorKind::ResourceBusy,
+                "device already has an active USB/IP client",
+            ));
+        }
+        Ok(DeviceClaim {
+            bus_id: bus_id.to_owned(),
+            active: Arc::clone(&self.active),
+        })
     }
 
     pub fn monitor_reenumeration(&self) -> io::Result<()> {
@@ -145,6 +167,7 @@ impl DeviceProvider for ExportDriverProvider {
                 "device is not exported by this session",
             ));
         }
+        let claim = self.claim(bus_id)?;
         let found = find_devices()?
             .into_iter()
             .find(|device| device.bus_id == bus_id)
@@ -153,7 +176,21 @@ impl DeviceProvider for ExportDriverProvider {
             path: found.path,
             bus_id: found.bus_id,
             cancels: Mutex::new(HashMap::new()),
+            _claim: claim,
         }))
+    }
+}
+
+struct DeviceClaim {
+    bus_id: String,
+    active: Arc<Mutex<HashSet<String>>>,
+}
+
+impl Drop for DeviceClaim {
+    fn drop(&mut self) {
+        if let Ok(mut active) = self.active.lock() {
+            active.remove(&self.bus_id);
+        }
     }
 }
 
@@ -161,6 +198,7 @@ struct DriverSession {
     path: String,
     bus_id: String,
     cancels: Mutex<HashMap<u32, u64>>,
+    _claim: DeviceClaim,
 }
 
 impl DeviceSession for DriverSession {
@@ -216,6 +254,32 @@ impl DeviceSession for DriverSession {
             *cancels.entry(endpoint).or_insert(0) += 1;
         }
         let _ = abort_endpoint(&self.path, endpoint);
+    }
+
+    fn release(&self) {
+        let request = TransferRequest {
+            sequence: 0,
+            direction: Direction::Out,
+            endpoint: 0,
+            transfer_flags: 0,
+            transfer_length: 0,
+            start_frame: 0,
+            interval: 0,
+            setup: [0x00, 0x09, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+            data: Vec::new(),
+            iso_packets: Vec::new(),
+        };
+        match transfer(&self.path, &request) {
+            Ok(completion) if completion.status == 0 => {}
+            Ok(completion) => eprintln!(
+                "{}: deconfigure on session release failed with status {}",
+                self.bus_id, completion.status
+            ),
+            Err(error) => eprintln!(
+                "{}: deconfigure on session release ioctl failed: {error}",
+                self.bus_id
+            ),
+        }
     }
 
     fn disconnected(&self) -> bool {

@@ -551,12 +551,20 @@ disconnected, and the macOS importer rebuilds it. The Windows exporter also
 remembers its published INF and re-applies it when the selected port appears as
 normal (`12a8`), recovery (`1281`), or DFU (`1227`).
 
+Every physical device is claimed by at most one USB/IP connection. On session
+teardown, the server cancels all still-pending endpoints before deconfiguring
+the physical phone with `SET_CONFIGURATION 0`. This prevents an abandoned IN
+request from consuming the replacement session's first usbmux reply, resets
+Apple's mux sequence state, and makes the next import behave like a physical
+unplug/replug. A second importer is rejected while the first claim is live.
+
 Apple's signed package outranks a development-signed package, and an open Apple
 child function vetoes parent replacement. The installer therefore stops Apple
 Mobile Device Service and Bonjour, disables `MI_00`/`MI_01`, force-binds the
 parent, and leaves those services stopped while exporting.
 
 Normal-mode enumeration, the trust re-enumeration, Configurator discovery, and
-live usbmux traffic are verified. A destructive restore/recovery/DFU cycle has
-not been run on this phone. `cfgutil restart` could not perform the
-non-destructive lifecycle test because the pairing prompt had not been accepted.
+live usbmux and NCM traffic are verified with the Rust KMDF driver. The clean
+session automatically verified the existing manual pairing, reached CoreDevice
+`Available`, and was listed by both Apple Configurator and `cfgutil`. A
+destructive restore/recovery/DFU cycle has not been run on this phone.

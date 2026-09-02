@@ -52,6 +52,11 @@ pub trait DeviceSession: Send + Sync + 'static {
     fn submit(&self, request: TransferRequest) -> TransferCompletion;
     fn cancel(&self, endpoint: u32);
 
+    /// Releases connection-scoped state after all pending endpoints have been
+    /// canceled. Physical exporters can use this to return a device to its
+    /// unconfigured state so a later import starts like a real USB replug.
+    fn release(&self) {}
+
     /// The device backing this session is gone for good: it re-enumerated, was
     /// unplugged, or reset into a different descriptor set. The server drops the
     /// connection so the importer tears its virtual device down and re-imports,
@@ -281,6 +286,7 @@ fn transfer_loop(mut reader: TcpStream, device: Arc<dyn DeviceSession>) -> io::R
     for endpoint in endpoints {
         device.cancel(endpoint);
     }
+    device.release();
 
     result
 }
@@ -499,6 +505,7 @@ mod tests {
         cancel_changed: Condvar,
         blocking_started: Mutex<bool>,
         blocking_changed: Condvar,
+        released: Mutex<bool>,
     }
 
     impl DeviceSession for TestDevice {
@@ -529,6 +536,10 @@ mod tests {
         fn cancel(&self, _endpoint: u32) {
             *self.canceled.lock().unwrap() = true;
             self.cancel_changed.notify_all();
+        }
+
+        fn release(&self) {
+            *self.released.lock().unwrap() = true;
         }
     }
 
@@ -662,6 +673,10 @@ mod tests {
         assert!(
             *device.canceled.lock().unwrap(),
             "connection teardown must cancel the pending endpoint"
+        );
+        assert!(
+            *device.released.lock().unwrap(),
+            "connection teardown must release backend session state"
         );
     }
 }
