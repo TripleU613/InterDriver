@@ -22,11 +22,23 @@ Every direction is implemented and has been run on real hardware.
 | --- | --- | --- | --- |
 | **Linux** | yes | yes | yes |
 | **macOS** | yes | yes | yes |
-| **Windows** | yes | yes | yes |
+| **Windows** | yes\* | yes\* | yes\* |
 
 Proven end to end: Apple Configurator on a MacBook driving an iPhone physically
 attached to a Linux box — `cfgutil list` returns the real ECID and UDID, and a
-full iOS restore streams over the link.
+full iOS restore ran to completion over the link.
+
+\* **Exporting from Windows does not work for iPhones.** The Windows exporter is
+built on WinUSB, and `winusb.sys` refuses any device that advertises more than
+one USB configuration — it fails the device with `CM_PROB_FAILED_ADD` and
+`STATUS_DEVICE_CONFIGURATION_ERROR (0xc0000182)`. An iPhone advertises four or
+five. This is a WinUSB limitation, not an INF problem: binding it to the
+composite parent instead of a single interface fails the same way. Simple
+single-configuration devices export from Windows fine (verified with a webcam).
+
+To export an iPhone from Windows the exporter needs its own KMDF lower filter on
+the device stack instead of WinUSB. That is not written yet. Until it is, put the
+iPhone on the Linux box — that path is complete and proven.
 
 ---
 
@@ -52,6 +64,10 @@ gets carried — if the device reboots or re-enumerates, the link follows it.
 This is the hardest path in the project. Follow it in order; the two steps people
 lose a day to are marked **← this one**.
 
+> **Read this first:** this guide gets you a WinUSB-bound device. It works for
+> ordinary USB devices. It does **not** work for an iPhone — see the note on the
+> matrix above. For iPhone-to-Configurator today, export from Linux.
+
 ### 1. Windows: find the device
 
 ```powershell
@@ -67,7 +83,15 @@ The exporter opens the device through WinUSB, so the interface must be bound to
 it. For an iPhone that means the `MI_01` interface (Apple USB Multiplexor).
 
 ```powershell
-interdriver-usb windows install-driver C:\path\to\interdriver-winusb.inf
+interdriver-usb windows install-driver C:\path\to\winusb.inf
+```
+
+Windows ranks an inbox or WHQL-signed driver above a test-signed one whatever the
+version says, so a plain install will be told "driver package is up-to-date" and
+change nothing. Force it:
+
+```powershell
+interdriver-usb windows force-driver "USB\VID_xxxx&PID_yyyy&MI_01" C:\path\to\winusb.inf
 ```
 
 **Reboot before you try anything else.** A forced driver swap leaves Windows in a

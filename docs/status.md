@@ -515,3 +515,34 @@ of machines has no direct route — tailscale falls back to `DERP(nyc)` at
 transfers/s and makes a lockdown read take ~110s. A direct route, or
 pipelining multiple URBs per endpoint (which needs per-endpoint completion
 ordering to stay stream-safe), is where the speed is.
+
+## Windows iPhone export — blocked by WinUSB (2026-09-02)
+
+An iPhone cannot be exported from Windows with the current WinUSB-based
+exporter. `winusb.sys` fails the device with `CM_PROB_FAILED_ADD` and problem
+status `0xc0000182` (`STATUS_DEVICE_CONFIGURATION_ERROR`) because it does not
+support devices advertising more than one USB configuration, and an iPhone
+advertises four or five.
+
+Ruled out along the way, on real hardware (`win-test`, iPhone `00008030000E35002245802E`):
+
+- Not an INF or signing problem. The package installs and binds: the devnode
+  reports `service=WINUSB` with our INF and the InterDriver test certs are still
+  trusted, so the catalog validates.
+- Not a ranking problem. Apple's WHQL-signed `oem57.inf` outranks a test-signed
+  package whatever the DriverVer says, so `pnputil /add-driver /install` reports
+  "up-to-date" and changes nothing; `force_driver()` (UpdateDriverForPlugAndPlay
+  with INSTALLFLAG_FORCE) does replace it, and the failure persists.
+- Not a filter problem. No Lower/UpperFilters remained on the devnode or class.
+- Not a "single interface" problem. Binding the composite parent instead of
+  MI_01, replacing usbccgp so WinUSB owns the whole device, fails identically.
+- The in-box `winusb.inf` on this build has no `WINUSB.NT.Wdf` section; needing
+  it is an error, and `WINUSB.NT.HW` should be included. Both were corrected and
+  the device still fails.
+
+Exporting an iPhone from Windows needs a KMDF lower filter of our own on the
+device stack rather than WinUSB. Simple single-configuration devices are
+unaffected and still export (verified with a webcam).
+
+The box was returned to stock: all five of our driver packages removed and the
+phone back on Apple's drivers with every node reporting OK.

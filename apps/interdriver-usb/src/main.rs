@@ -55,6 +55,11 @@ fn run(mut args: Vec<String>) -> Result<(), String> {
         [platform, command, inf] if platform == "windows" && command == "install-driver" => {
             windows_install_driver(inf)
         }
+        [platform, command, hardware_id, inf]
+            if platform == "windows" && command == "force-driver" =>
+        {
+            windows_force_driver(hardware_id, inf)
+        }
         [platform, command, remote, bus_id] if platform == "windows" && command == "attach" => {
             windows_attach(remote, bus_id, ticket)
         }
@@ -160,6 +165,7 @@ fn print_help() {
     println!("  interdriver-usb linux detach <port>");
     println!("  interdriver-usb windows list");
     println!("  interdriver-usb windows install-driver <inf-path>");
+    println!("  interdriver-usb windows force-driver <hardware-id> <inf-path>");
     println!("  interdriver-usb windows attach <host> <bus-id> [--ticket <hex>]");
     println!("  interdriver-usb windows detach");
     println!("  interdriver-usb windows export <bus-id> [port]");
@@ -637,6 +643,22 @@ fn windows_install_driver(inf: &str) -> Result<(), String> {
         println!("windows requests a reboot to finish");
     }
     Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn windows_force_driver(hardware_id: &str, inf: &str) -> Result<(), String> {
+    let reboot = interdriver_platform_windows::force_driver(hardware_id, inf)
+        .map_err(|error| format!("force-driver {hardware_id}: {error}"))?;
+    println!("forced {hardware_id} onto {inf}");
+    if reboot {
+        println!("REBOOT REQUIRED before the interface can be opened");
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn windows_force_driver(_hardware_id: &str, _inf: &str) -> Result<(), String> {
+    Err("Windows adapter is unavailable on this platform".into())
 }
 
 #[cfg(not(target_os = "windows"))]

@@ -10,7 +10,7 @@ mod install;
 pub mod ude;
 
 #[cfg(target_os = "windows")]
-pub use install::install_root_device;
+pub use install::{force_driver, install_root_device};
 
 #[cfg(target_os = "windows")]
 mod winusb;

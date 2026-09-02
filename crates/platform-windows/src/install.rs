@@ -130,3 +130,32 @@ pub fn install_root_device(hardware_id: &str, inf_path: &str) -> io::Result<bool
     }
     Ok(reboot != 0)
 }
+
+/// Forces an existing device onto the driver in `inf_path`, replacing whatever
+/// it is bound to now.
+///
+/// Ranking will not do this on its own: an inbox or WHQL-signed driver outranks
+/// a test-signed one whatever the version says, so an Apple interface stays on
+/// Apple's driver even when a matching WinUSB package is installed. This is the
+/// same forced replacement Device Manager performs for "Have Disk".
+///
+/// Returns `true` when Windows wants a reboot before the change takes effect,
+/// which it usually does; until then the interface cannot be opened.
+pub fn force_driver(hardware_id: &str, inf_path: &str) -> io::Result<bool> {
+    let hwid = wide(hardware_id);
+    let inf = wide(inf_path);
+    let mut reboot_required: i32 = 0;
+    let updated = unsafe {
+        UpdateDriverForPlugAndPlayDevicesW(
+            std::ptr::null_mut(),
+            hwid.as_ptr(),
+            inf.as_ptr(),
+            INSTALLFLAG_FORCE,
+            &mut reboot_required,
+        )
+    };
+    if updated == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(reboot_required != 0)
+}
