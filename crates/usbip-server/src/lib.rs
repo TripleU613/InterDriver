@@ -1,3 +1,5 @@
+use interdriver_transport::{Acceptor, Connect, Transport, plain};
+pub use interdriver_transport::Transport as TransportHandle;
 use interdriver_usbip_protocol::{TICKET_LEN, TICKET_MAGIC,
 
     BUS_ID_LEN, BasicHeader, CONTROL_HEADER_LEN, Command, ControlHeader, DEVICE_RECORD_LEN,
@@ -7,14 +9,18 @@ use interdriver_usbip_protocol::{TICKET_LEN, TICKET_MAGIC,
 };
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Write};
-use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::Duration;
 
 pub const MAX_EXPORTED_DEVICES: usize = 64;
 pub const MAX_TRANSFER_LENGTH: usize = 64 * 1024 * 1024;
+
+/// How long an unfinished ticket handshake may block before the connection is
+/// dropped, so a peer that connects and then goes silent cannot hold a slot.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DeviceDescription {
@@ -78,48 +84,91 @@ pub trait DeviceProvider: Send + Sync + 'static {
 pub trait Authorizer: Send + Sync + 'static {
     fn authorize(&self, token: &[u8; TICKET_LEN]) -> bool;
 
-    /// Called once after a ticket is accepted, with a clone of the connection.
+    /// Called once after a ticket is accepted, with a handle on the connection.
     /// An implementation may watch the control plane and, on revocation, shut
     /// the connection down so the exporter releases the device mid-session. The
     /// default does nothing (a fixed ticket cannot be revoked).
-    fn watch(&self, _token: &[u8; TICKET_LEN], _connection: TcpStream) {}
+    fn watch(&self, _token: &[u8; TICKET_LEN], _connection: Box<dyn Transport>) {}
 }
 
-pub fn serve(
-    listener: TcpListener,
-    provider: Arc<dyn DeviceProvider>,
-    shutdown: Arc<AtomicBool>,
-) -> io::Result<()> {
-    serve_authorized(listener, provider, shutdown, None)
-}
-
-pub fn serve_authorized(
-    listener: TcpListener,
+/// Serves the provider over `connect`, which decides how the exporter reaches
+/// the outside world:
+///
+/// - a listening `Acceptor` is the classic model — importers dial the exporter,
+///   one connection per importer, spawned concurrently;
+/// - a dialing `Dialer` is the reverse model — the exporter dials the importer
+///   or a rendezvous relay, so a workstation behind a customer firewall needs
+///   no inbound port. It holds one connection at a time and redials when it
+///   drops.
+///
+/// The USB/IP roles are unchanged either way: the importer still speaks first.
+/// This is the only difference between the two, and it lives entirely in
+/// `connect`, so no device or protocol code depends on who opened the socket.
+pub fn serve_via(
+    mut connect: Box<dyn Connect>,
     provider: Arc<dyn DeviceProvider>,
     shutdown: Arc<AtomicBool>,
     authorizer: Option<Arc<dyn Authorizer>>,
 ) -> io::Result<()> {
-    listener.set_nonblocking(true)?;
+    let concurrent = connect.concurrent();
+    // A listener polls accept and wants a short, fixed idle sleep. A dialer
+    // reaching an importer that is down should back off instead of hammering it
+    // (a fleet of exporters pointed at one relay is otherwise self-inflicted
+    // load), so its idle sleep grows to a ceiling and resets on a good connect.
+    let idle_min = if concurrent {
+        Duration::from_millis(25)
+    } else {
+        Duration::from_millis(200)
+    };
+    let idle_max = Duration::from_secs(5);
+    let mut idle = idle_min;
     while !shutdown.load(Ordering::Acquire) {
-        match listener.accept() {
-            Ok((stream, _)) => {
-                // Windows hands back an accepted socket that inherits the
-                // listener's non-blocking mode, so every read would fail with
-                // WouldBlock; Linux does not inherit it. Force blocking mode.
-                if let Err(error) = stream.set_nonblocking(false) {
-                    eprintln!("cannot set accepted socket blocking: {error}");
-                    continue;
-                }
+        match connect.connect() {
+            Ok(stream) => {
+                idle = idle_min;
                 let provider = Arc::clone(&provider);
                 let authorizer = authorizer.clone();
-                thread::Builder::new()
-                    .name("interdriver-usbip-server".into())
-                    .spawn(move || {
-                        let _ = serve_connection_authorized(stream, provider, authorizer);
-                    })?;
+                if concurrent {
+                    thread::Builder::new()
+                        .name("interdriver-usbip-server".into())
+                        .spawn(move || {
+                            let _ = serve_connection_authorized(stream, provider, authorizer);
+                        })?;
+                } else {
+                    // Reverse mode holds one importer at a time; serve it here
+                    // and redial only once it is gone. A watcher shuts the live
+                    // connection down the instant `shutdown` flips, so Ctrl-C is
+                    // observed mid-session rather than only between sessions --
+                    // which is what makes the exporter release the device (and
+                    // run its restore) promptly on exit.
+                    let done = Arc::new(AtomicBool::new(false));
+                    if let Ok(handle) = stream.split() {
+                        let shutdown = Arc::clone(&shutdown);
+                        let watcher_done = Arc::clone(&done);
+                        thread::Builder::new()
+                            .name("interdriver-usbip-dial-watch".into())
+                            .spawn(move || {
+                                while !watcher_done.load(Ordering::Acquire) {
+                                    if shutdown.load(Ordering::Acquire) {
+                                        let _ = handle.shutdown();
+                                        return;
+                                    }
+                                    thread::sleep(Duration::from_millis(100));
+                                }
+                            })?;
+                    }
+                    let _ = serve_connection_authorized(stream, provider, authorizer);
+                    done.store(true, Ordering::Release);
+                }
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(25));
+                thread::sleep(idle);
+                // A listener keeps polling accept at a steady, snappy interval;
+                // only a dialer backs off toward the ceiling while it cannot
+                // reach the far end.
+                if !concurrent {
+                    idle = (idle * 2).min(idle_max);
+                }
             }
             Err(error) => return Err(error),
         }
@@ -127,19 +176,47 @@ pub fn serve_authorized(
     Ok(())
 }
 
+/// Classic listen entry point: serve the provider on a listener the caller
+/// opened, one spawned connection per importer, plain TCP. A thin shim over
+/// [`serve_via`] with a plaintext [`Acceptor`]; kept so existing callers and
+/// the smoke tests do not change.
+pub fn serve(
+    listener: std::net::TcpListener,
+    provider: Arc<dyn DeviceProvider>,
+    shutdown: Arc<AtomicBool>,
+) -> io::Result<()> {
+    serve_authorized(listener, provider, shutdown, None)
+}
+
+/// As [`serve`], but gating each connection on a session ticket.
+pub fn serve_authorized(
+    listener: std::net::TcpListener,
+    provider: Arc<dyn DeviceProvider>,
+    shutdown: Arc<AtomicBool>,
+    authorizer: Option<Arc<dyn Authorizer>>,
+) -> io::Result<()> {
+    let acceptor = Acceptor::from_listener(listener, HANDSHAKE_TIMEOUT, plain())?;
+    serve_via(Box::new(acceptor), provider, shutdown, authorizer)
+}
+
 pub fn serve_connection(
-    stream: TcpStream,
+    stream: Box<dyn Transport>,
     provider: Arc<dyn DeviceProvider>,
 ) -> io::Result<()> {
     serve_connection_authorized(stream, provider, None)
 }
 
 pub fn serve_connection_authorized(
-    mut stream: TcpStream,
+    mut stream: Box<dyn Transport>,
     provider: Arc<dyn DeviceProvider>,
     authorizer: Option<Arc<dyn Authorizer>>,
 ) -> io::Result<()> {
-    stream.set_nodelay(true)?;
+    // Bound the whole handshake — the optional ticket AND the control request —
+    // so a peer that connects and then goes silent cannot pin a device slot.
+    // This matters most on the unauthenticated reverse path (windows/macos
+    // export dial out with no authorizer), where a silent peer would otherwise
+    // hold the one live session open forever.
+    stream.set_timeouts(Some(HANDSHAKE_TIMEOUT))?;
     if let Some(authorizer) = authorizer {
         let mut magic = [0_u8; TICKET_MAGIC.len()];
         stream.read_exact(&mut magic)?;
@@ -151,11 +228,13 @@ pub fn serve_connection_authorized(
         if !authorizer.authorize(&token) {
             return Err(invalid_data("session ticket rejected"));
         }
-        if let Ok(connection) = stream.try_clone() {
+        if let Ok(connection) = stream.split() {
             authorizer.watch(&token, connection);
         }
     }
     let request = read_control_header(&mut stream)?;
+    // The data plane is long-lived and must not time out between transfers.
+    stream.set_timeouts(None)?;
     match request.code {
         OP_REQ_DEVLIST => send_device_list(&mut stream, provider.as_ref()),
         OP_REQ_IMPORT => import_device(stream, provider),
@@ -165,7 +244,10 @@ pub fn serve_connection_authorized(
     }
 }
 
-fn send_device_list(stream: &mut TcpStream, provider: &dyn DeviceProvider) -> io::Result<()> {
+fn send_device_list(
+    stream: &mut Box<dyn Transport>,
+    provider: &dyn DeviceProvider,
+) -> io::Result<()> {
     let devices = provider.list()?;
     if devices.len() > MAX_EXPORTED_DEVICES {
         return Err(invalid_data("too many exported devices"));
@@ -190,7 +272,10 @@ fn send_device_list(stream: &mut TcpStream, provider: &dyn DeviceProvider) -> io
     stream.flush()
 }
 
-fn import_device(mut stream: TcpStream, provider: Arc<dyn DeviceProvider>) -> io::Result<()> {
+fn import_device(
+    mut stream: Box<dyn Transport>,
+    provider: Arc<dyn DeviceProvider>,
+) -> io::Result<()> {
     let mut bytes = [0; BUS_ID_LEN];
     stream.read_exact(&mut bytes)?;
     let request = ImportRequest::decode(&bytes).map_err(protocol_error)?;
@@ -231,7 +316,7 @@ fn import_device(mut stream: TcpStream, provider: Arc<dyn DeviceProvider>) -> io
     )?;
     stream.write_all(&description.device.encode())?;
     stream.flush()?;
-    let watchdog_done = watch_for_disconnect(&stream, Arc::clone(&device))?;
+    let watchdog_done = watch_for_disconnect(stream.as_ref(), Arc::clone(&device))?;
     let result = transfer_loop(stream, device);
     watchdog_done.store(true, Ordering::Release);
     result
@@ -242,10 +327,10 @@ fn import_device(mut stream: TcpStream, provider: Arc<dyn DeviceProvider>) -> io
 /// waits for a rebooting device there is no traffic to fail, so without this the
 /// session would sit on a device that is already gone.
 fn watch_for_disconnect(
-    stream: &TcpStream,
+    stream: &dyn Transport,
     device: Arc<dyn DeviceSession>,
 ) -> io::Result<Arc<AtomicBool>> {
-    let stream = stream.try_clone()?;
+    let stream = stream.split()?;
     let done = Arc::new(AtomicBool::new(false));
     let thread_done = Arc::clone(&done);
     thread::Builder::new()
@@ -257,7 +342,7 @@ fn watch_for_disconnect(
             if thread_done.load(Ordering::Acquire) {
                 return;
             }
-            let _ = stream.shutdown(std::net::Shutdown::Both);
+            let _ = stream.shutdown();
         })?;
     Ok(done)
 }
@@ -266,8 +351,9 @@ struct Pending {
     endpoint: u32,
 }
 
-fn transfer_loop(mut reader: TcpStream, device: Arc<dyn DeviceSession>) -> io::Result<()> {
-    let writer = Arc::new(Mutex::new(reader.try_clone()?));
+fn transfer_loop(reader: Box<dyn Transport>, device: Arc<dyn DeviceSession>) -> io::Result<()> {
+    let writer = Arc::new(Mutex::new(reader.split()?));
+    let mut reader = reader;
     let pending = Arc::new(Mutex::new(HashMap::<u32, Pending>::new()));
     let result = transfer_loop_inner(&mut reader, &device, &writer, &pending);
 
@@ -292,11 +378,19 @@ fn transfer_loop(mut reader: TcpStream, device: Arc<dyn DeviceSession>) -> io::R
 }
 
 fn transfer_loop_inner(
-    reader: &mut TcpStream,
+    reader: &mut Box<dyn Transport>,
     device: &Arc<dyn DeviceSession>,
-    writer: &Arc<Mutex<TcpStream>>,
+    writer: &Arc<Mutex<Box<dyn Transport>>>,
     pending: &Arc<Mutex<HashMap<u32, Pending>>>,
 ) -> io::Result<()> {
+    // One worker thread per endpoint. Same-endpoint transfers are handed to the
+    // same worker and run strictly in arrival order (which is submission order,
+    // since one TCP stream carries them), so a pipelined bulk pipe's reads reach
+    // the device and come back in order — a reordered bulk stream is a corrupted
+    // transfer. Different endpoints have different workers and run concurrently,
+    // so a parked IN read never blocks another endpoint. With a one-in-flight
+    // importer this is identical to before: each worker only ever holds one.
+    let mut workers: HashMap<u32, mpsc::Sender<TransferRequest>> = HashMap::new();
     loop {
         let mut bytes = [0; URB_HEADER_LEN];
         reader.read_exact(&mut bytes)?;
@@ -306,27 +400,21 @@ fn transfer_loop_inner(
                 let sequence = request.sequence;
                 let endpoint = request.endpoint;
                 lock(pending)?.insert(sequence, Pending { endpoint });
-                let device = Arc::clone(device);
-                let writer = Arc::clone(writer);
-                let pending = Arc::clone(pending);
-                thread::Builder::new()
-                    .name(format!("interdriver-usbip-urb-{sequence}"))
-                    .spawn(move || {
-                        let direction = request.direction;
-                        let completion = device.submit(request);
-                        let should_reply = lock(&pending)
-                            .ok()
-                            .and_then(|mut pending| pending.remove(&sequence))
-                            .is_some();
-                        if should_reply {
-                            let _ = write_submit_reply(&writer, sequence, direction, completion);
-                        }
-                        if device.disconnected()
-                            && let Ok(writer) = lock(&writer)
-                        {
-                            let _ = writer.shutdown(std::net::Shutdown::Both);
-                        }
-                    })?;
+                if let std::collections::hash_map::Entry::Vacant(slot) = workers.entry(endpoint) {
+                    let (sender, receiver) = mpsc::channel::<TransferRequest>();
+                    let device = Arc::clone(device);
+                    let writer = Arc::clone(writer);
+                    let pending = Arc::clone(pending);
+                    thread::Builder::new()
+                        .name(format!("interdriver-usbip-ep-{endpoint}"))
+                        .spawn(move || endpoint_worker(&receiver, &device, &writer, &pending))?;
+                    slot.insert(sender);
+                }
+                if workers[&endpoint].send(request).is_err() {
+                    // The worker is gone (only on teardown); drop the pending
+                    // entry so the bookkeeping stays consistent.
+                    lock(pending)?.remove(&sequence);
+                }
             }
             UrbHeader::Unlink(unlink) => {
                 let removed = lock(pending)?.remove(&unlink.target_sequence);
@@ -355,7 +443,43 @@ fn transfer_loop_inner(
     }
 }
 
-fn read_submit_request(reader: &mut TcpStream, submit: Submit) -> io::Result<TransferRequest> {
+/// Processes one endpoint's transfers in the order they arrive, serially. This
+/// is what preserves per-endpoint ordering: the next transfer on this endpoint
+/// does not touch the device until this one has completed and been answered.
+fn endpoint_worker(
+    receiver: &mpsc::Receiver<TransferRequest>,
+    device: &Arc<dyn DeviceSession>,
+    writer: &Arc<Mutex<Box<dyn Transport>>>,
+    pending: &Arc<Mutex<HashMap<u32, Pending>>>,
+) {
+    for request in receiver {
+        let sequence = request.sequence;
+        let direction = request.direction;
+        let completion = device.submit(request);
+        let should_reply = lock(pending)
+            .ok()
+            .and_then(|mut pending| pending.remove(&sequence))
+            .is_some();
+        if should_reply {
+            let _ = write_submit_reply(writer, sequence, direction, completion);
+        }
+        // Fast path only: shut the connection the moment a completed transfer
+        // shows the device is gone. A transfer that is legitimately parked (a
+        // quiet IN read re-arming forever) never reaches here, so it is the
+        // independent `watch_for_disconnect` watchdog, not this check, that
+        // detects a device leaving while an endpoint is parked.
+        if device.disconnected()
+            && let Ok(writer) = lock(writer)
+        {
+            let _ = writer.shutdown();
+        }
+    }
+}
+
+fn read_submit_request(
+    reader: &mut Box<dyn Transport>,
+    submit: Submit,
+) -> io::Result<TransferRequest> {
     let transfer_length = usize::try_from(submit.transfer_buffer_length)
         .map_err(|_| invalid_data("negative transfer length"))?;
     if transfer_length > MAX_TRANSFER_LENGTH {
@@ -392,7 +516,7 @@ fn read_submit_request(reader: &mut TcpStream, submit: Submit) -> io::Result<Tra
 }
 
 fn write_submit_reply(
-    writer: &Mutex<TcpStream>,
+    writer: &Mutex<Box<dyn Transport>>,
     sequence: u32,
     direction: Direction,
     completion: TransferCompletion,
@@ -437,7 +561,7 @@ fn write_submit_reply(
     writer.flush()
 }
 
-fn read_control_header(stream: &mut TcpStream) -> io::Result<ControlHeader> {
+fn read_control_header(stream: &mut Box<dyn Transport>) -> io::Result<ControlHeader> {
     let mut bytes = [0; CONTROL_HEADER_LEN];
     stream.read_exact(&mut bytes)?;
     ControlHeader::decode(&bytes).map_err(protocol_error)
@@ -461,8 +585,10 @@ const _: usize = INTERFACE_RECORD_LEN;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::TcpListener;
+    use interdriver_transport::{Acceptor, Transport, plain};
+    use std::net::TcpStream;
     use std::sync::Condvar;
+    use std::time::Duration;
 
     struct Provider {
         session: Arc<TestDevice>,
@@ -549,12 +675,14 @@ mod tests {
         })
     }
 
+    /// Runs one connection through the listen path against a real socket pair.
     fn one_connection(provider: Arc<Provider>) -> (std::net::SocketAddr, thread::JoinHandle<()>) {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let address = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
-            let _ = serve_connection(stream, provider);
+            stream.set_nodelay(true).unwrap();
+            let _ = serve_connection(Box::new(stream), provider);
         });
         (address, server)
     }
@@ -564,21 +692,25 @@ mod tests {
         fn authorize(&self, _token: &[u8; TICKET_LEN]) -> bool {
             true
         }
-        fn watch(&self, _token: &[u8; TICKET_LEN], connection: TcpStream) {
+        fn watch(&self, _token: &[u8; TICKET_LEN], connection: Box<dyn Transport>) {
             // simulate an immediate revocation: drop the live connection
-            let _ = connection.shutdown(std::net::Shutdown::Both);
+            let _ = connection.shutdown();
         }
     }
 
     #[test]
     fn watch_can_drop_a_live_connection_after_auth() {
         use std::io::{Read, Write};
-        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let address = listener.local_addr().unwrap();
         let provider = provider();
         let server = thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
-            let _ = serve_connection_authorized(stream, provider, Some(Arc::new(RevokingAuthorizer)));
+            let _ = serve_connection_authorized(
+                Box::new(stream),
+                provider,
+                Some(Arc::new(RevokingAuthorizer)),
+            );
         });
 
         let mut client = TcpStream::connect(address).unwrap();
@@ -679,4 +811,329 @@ mod tests {
             "connection teardown must release backend session state"
         );
     }
+
+    #[test]
+    fn reverse_dial_exporter_reaches_a_listening_importer() {
+        // The importer listens; the exporter dials out to it, exactly the
+        // topology a workstation behind a customer firewall needs. USB/IP still
+        // flows importer-first over the connection the exporter opened.
+        let importer_listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let importer_addr = importer_listener.local_addr().unwrap();
+
+        let provider = provider();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let exporter_shutdown = Arc::clone(&shutdown);
+        let dialer =
+            interdriver_transport::Dialer::new(importer_addr, Duration::from_secs(1), plain()).unwrap();
+        let exporter = thread::spawn(move || {
+            let _ = serve_via(Box::new(dialer), provider, exporter_shutdown, None);
+        });
+
+        // Importer side: accept the exporter's dial, then import over it.
+        let (stream, _) = importer_listener.accept().unwrap();
+        stream.set_nodelay(true).unwrap();
+        let transport: Box<dyn Transport> = Box::new(stream);
+        let imported =
+            interdriver_usbip_client::import_on(transport, "1-2", Duration::from_secs(1), None).unwrap();
+        assert_eq!(imported.device.vendor_id, 0x05ac);
+        let session = interdriver_usbip_session::Session::from_imported(imported).unwrap();
+        let completion = session
+            .submit(interdriver_usbip_session::TransferRequest::input(1, 64))
+            .unwrap()
+            .wait_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap();
+        assert_eq!(completion.data, b"phone");
+        drop(session);
+        shutdown.store(true, Ordering::Release);
+        exporter.join().unwrap();
+    }
+
+    #[test]
+    fn acceptor_serves_a_dialing_importer() {
+        // The classic direction, but exercised through serve_via + Acceptor to
+        // prove the listen path still works after the transport rewrite.
+        let acceptor =
+            Acceptor::bind(("127.0.0.1", 0), Duration::from_secs(1), plain()).unwrap();
+        let address = acceptor.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server_shutdown = Arc::clone(&shutdown);
+        let provider = provider();
+        let server = thread::spawn(move || {
+            let _ = serve_via(Box::new(acceptor), provider, server_shutdown, None);
+        });
+        let session =
+            interdriver_usbip_session::Session::connect(address, "1-2", Duration::from_secs(1))
+                .unwrap();
+        let completion = session
+            .submit(interdriver_usbip_session::TransferRequest::input(1, 64))
+            .unwrap()
+            .wait_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap();
+        assert_eq!(completion.data, b"phone");
+        drop(session);
+        shutdown.store(true, Ordering::Release);
+        server.join().unwrap();
+    }
+
+    /// A device whose IN completion is delayed by `setup[0]` milliseconds, so a
+    /// later submission can finish before an earlier one and the pipeline's
+    /// reordering is actually exercised rather than trivially satisfied.
+    struct DelayProvider;
+
+    impl DeviceProvider for DelayProvider {
+        fn list(&self) -> io::Result<Vec<DeviceDescription>> {
+            let mut device = interdriver_usbip_protocol::DeviceRecord::new(
+                "/sys/usb/1-2", "1-2", 1, 2, 3, 0x05ac, 0x12a8,
+            )
+            .unwrap();
+            device.interface_count = 0;
+            Ok(vec![DeviceDescription { device, interfaces: Vec::new() }])
+        }
+        fn open(&self, _bus_id: &str) -> io::Result<Arc<dyn DeviceSession>> {
+            Ok(Arc::new(DelayDevice))
+        }
+    }
+
+    struct DelayDevice;
+    impl DeviceSession for DelayDevice {
+        fn submit(&self, request: TransferRequest) -> TransferCompletion {
+            let millis = u64::from(request.setup[0]);
+            thread::sleep(Duration::from_millis(millis));
+            // Echo the tag byte back so the test can identify which submission
+            // this completion belongs to.
+            TransferCompletion {
+                status: 0,
+                actual_length: 1,
+                start_frame: 0,
+                error_count: 0,
+                data: vec![request.setup[1]],
+                iso_packets: Vec::new(),
+            }
+        }
+        fn cancel(&self, _endpoint: u32) {}
+    }
+
+    fn delay_server() -> (std::net::SocketAddr, Arc<AtomicBool>, thread::JoinHandle<()>) {
+        let acceptor = Acceptor::bind(("127.0.0.1", 0), Duration::from_secs(1), plain()).unwrap();
+        let address = acceptor.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server_shutdown = Arc::clone(&shutdown);
+        let handle = thread::spawn(move || {
+            let _ = serve_via(Box::new(acceptor), Arc::new(DelayProvider), server_shutdown, None);
+        });
+        (address, shutdown, handle)
+    }
+
+    /// A request whose backend delay is `delay_ms` and whose echoed tag is `tag`.
+    fn tagged(endpoint: u32, delay_ms: u8, tag: u8) -> interdriver_usbip_session::TransferRequest {
+        let mut request = interdriver_usbip_session::TransferRequest::input(endpoint, 1);
+        request.setup = [delay_ms, tag, 0, 0, 0, 0, 1, 0];
+        request
+    }
+
+    #[test]
+    fn pipeline_delivers_one_endpoint_in_submission_order() {
+        use interdriver_usbip_session::{Pipeline, Session};
+        let (address, shutdown, server) = delay_server();
+        let session = Session::connect(address, "1-2", Duration::from_secs(2)).unwrap();
+
+        let order = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let recorded = Arc::clone(&order);
+        let mut pipeline = Pipeline::new(session, 8, move |_endpoint, token: u8, result| {
+            let completion = result.unwrap();
+            // the backend echoed the submission tag; both must agree
+            assert_eq!(completion.data, vec![token]);
+            recorded.lock().unwrap().push(token);
+        });
+
+        // Submit three on endpoint 3, first the slowest. If the pipeline did not
+        // reorder, the callback order would be 3,2,1 (fastest first).
+        pipeline.submit(3, 1_u8, tagged(3, 90, 1)).unwrap();
+        pipeline.submit(3, 2_u8, tagged(3, 40, 2)).unwrap();
+        pipeline.submit(3, 3_u8, tagged(3, 5, 3)).unwrap();
+        pipeline.drain();
+        assert_eq!(*order.lock().unwrap(), vec![1, 2, 3], "one endpoint must emit in submission order");
+
+        drop(pipeline);
+        shutdown.store(true, Ordering::Release);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn pipeline_does_not_head_of_line_block_across_endpoints() {
+        use interdriver_usbip_session::{Pipeline, Session};
+        let (address, shutdown, server) = delay_server();
+        let session = Session::connect(address, "1-2", Duration::from_secs(2)).unwrap();
+
+        let order = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let recorded = Arc::clone(&order);
+        let mut pipeline = Pipeline::new(session, 8, move |_endpoint, token: u8, _result| {
+            recorded.lock().unwrap().push(token);
+        });
+
+        // A slow transfer on endpoint 3 and a fast one on endpoint 5. The fast
+        // one must be delivered first even though it was submitted second,
+        // because a different endpoint must not be held up.
+        pipeline.submit(3, 10_u8, tagged(3, 120, 10)).unwrap();
+        pipeline.submit(5, 20_u8, tagged(5, 5, 20)).unwrap();
+        pipeline.drain();
+        let recorded = order.lock().unwrap().clone();
+        assert_eq!(recorded, vec![20, 10], "a slow endpoint must not block a fast one");
+
+        drop(pipeline);
+        shutdown.store(true, Ordering::Release);
+        server.join().unwrap();
+    }
+
+
+    /// A backend that stamps each submit with a monotonically increasing byte,
+    /// so the reply data reveals the order in which the exporter actually ran
+    /// the transfers. With per-endpoint serialization the stamp must match the
+    /// submission order on that endpoint.
+    struct OrderProvider;
+    impl DeviceProvider for OrderProvider {
+        fn list(&self) -> io::Result<Vec<DeviceDescription>> {
+            let mut device = interdriver_usbip_protocol::DeviceRecord::new(
+                "/sys/usb/1-2", "1-2", 1, 2, 3, 0x05ac, 0x12a8,
+            ).unwrap();
+            device.interface_count = 0;
+            Ok(vec![DeviceDescription { device, interfaces: Vec::new() }])
+        }
+        fn open(&self, _bus_id: &str) -> io::Result<Arc<dyn DeviceSession>> {
+            Ok(Arc::new(OrderDevice { next: std::sync::atomic::AtomicU32::new(0) }))
+        }
+    }
+    struct OrderDevice { next: std::sync::atomic::AtomicU32 }
+    impl DeviceSession for OrderDevice {
+        fn submit(&self, request: TransferRequest) -> TransferCompletion {
+            // A small variable delay makes the thread race real: without
+            // per-endpoint ordering the stamps would interleave.
+            let jitter = 8 - (request.setup[0] as u64 % 8);
+            thread::sleep(Duration::from_millis(jitter));
+            let stamp = self.next.fetch_add(1, Ordering::SeqCst) as u8;
+            TransferCompletion {
+                status: 0, actual_length: 2, start_frame: 0, error_count: 0,
+                data: vec![request.setup[0], stamp], iso_packets: Vec::new(),
+            }
+        }
+        fn cancel(&self, _endpoint: u32) {}
+    }
+
+    #[test]
+    fn exporter_runs_one_endpoint_in_submission_order() {
+        // Submit many reads on ONE endpoint concurrently through the session
+        // (which allows unlimited outstanding transfers), and confirm the
+        // exporter stamped them in submission order — i.e. same-endpoint order
+        // is preserved end to end, which is what makes importer pipelining safe.
+        let acceptor = Acceptor::bind(("127.0.0.1", 0), Duration::from_secs(1), plain()).unwrap();
+        let address = acceptor.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server_shutdown = Arc::clone(&shutdown);
+        let server = thread::spawn(move || {
+            let _ = serve_via(Box::new(acceptor), Arc::new(OrderProvider), server_shutdown, None);
+        });
+        let session = std::sync::Arc::new(
+            interdriver_usbip_session::Session::connect(address, "1-2", Duration::from_secs(2)).unwrap(),
+        );
+
+        // Fire 24 reads on endpoint 5 as fast as possible; the Nth carries tag N.
+        const N: u8 = 24;
+        let mut pendings = Vec::new();
+        for tag in 0..N {
+            let mut request = interdriver_usbip_session::TransferRequest::input(5, 2);
+            request.setup = [tag, 0, 0, 0, 0, 0, 2, 0];
+            pendings.push((tag, session.submit(request).unwrap()));
+        }
+        // Collect completions in submission order (by our tag) and read the stamp.
+        let mut stamps = Vec::new();
+        for (tag, pending) in pendings {
+            let c = pending.wait_timeout(Duration::from_secs(5)).unwrap().unwrap();
+            assert_eq!(c.data[0], tag, "reply must match the submission it answers");
+            stamps.push(c.data[1]);
+        }
+        // The stamp assigned by the exporter must be strictly increasing in
+        // submission order: transfer submitted first ran first.
+        assert_eq!(
+            stamps,
+            (0..N).collect::<Vec<_>>(),
+            "same-endpoint transfers must run in submission order, got {stamps:?}"
+        );
+
+        drop(session);
+        shutdown.store(true, Ordering::Release);
+        server.join().unwrap();
+    }
+
+
+    /// A backend that returns the next byte of a known stream on each IN read of
+    /// one endpoint — a stand-in for reading a file off a bulk pipe in order.
+    struct StreamProvider;
+    impl DeviceProvider for StreamProvider {
+        fn list(&self) -> io::Result<Vec<DeviceDescription>> {
+            let mut device = interdriver_usbip_protocol::DeviceRecord::new(
+                "/sys/usb/1-2", "1-2", 1, 2, 3, 0x05ac, 0x12a8,
+            ).unwrap();
+            device.interface_count = 0;
+            Ok(vec![DeviceDescription { device, interfaces: Vec::new() }])
+        }
+        fn open(&self, _bus_id: &str) -> io::Result<Arc<dyn DeviceSession>> {
+            Ok(Arc::new(StreamDevice { offset: std::sync::atomic::AtomicU32::new(0) }))
+        }
+    }
+    struct StreamDevice { offset: std::sync::atomic::AtomicU32 }
+    impl DeviceSession for StreamDevice {
+        fn submit(&self, request: TransferRequest) -> TransferCompletion {
+            let jitter = 6 - (request.setup[0] as u64 % 6);
+            thread::sleep(Duration::from_millis(jitter));
+            let n = self.offset.fetch_add(1, Ordering::SeqCst);
+            // the stream byte at this position is just its low 8 bits
+            TransferCompletion {
+                status: 0, actual_length: 1, start_frame: 0, error_count: 0,
+                data: vec![(n & 0xff) as u8], iso_packets: Vec::new(),
+            }
+        }
+        fn cancel(&self, _endpoint: u32) {}
+    }
+
+    #[test]
+    fn pipelined_bulk_stream_reassembles_byte_correct() {
+        // The capstone: a pipelined importer with many transfers in flight, on an
+        // exporter that serializes per endpoint, reassembles a bulk stream in the
+        // exact order it was produced. This is the property a restore depends on.
+        use interdriver_usbip_session::{Pipeline, Session};
+        let acceptor = Acceptor::bind(("127.0.0.1", 0), Duration::from_secs(1), plain()).unwrap();
+        let address = acceptor.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server_shutdown = Arc::clone(&shutdown);
+        let server = thread::spawn(move || {
+            let _ = serve_via(Box::new(acceptor), Arc::new(StreamProvider), server_shutdown, None);
+        });
+        let session = Session::connect(address, "1-2", Duration::from_secs(3)).unwrap();
+
+        const N: u32 = 300;
+        let received = Arc::new(Mutex::new(Vec::<(u32, u8)>::new()));
+        let sink = Arc::clone(&received);
+        let mut pipeline = Pipeline::new(session, 16, move |_ep, seq: u32, result| {
+            let c = result.unwrap();
+            sink.lock().unwrap().push((seq, c.data[0]));
+        });
+        for i in 0..N {
+            let mut request = interdriver_usbip_session::TransferRequest::input(5, 1);
+            request.setup = [(i & 0xff) as u8, 0, 0, 0, 0, 0, 1, 0];
+            pipeline.submit(5, i, request).unwrap();
+        }
+        pipeline.drain();
+        let mut out = received.lock().unwrap().clone();
+        out.sort_by_key(|(seq, _)| *seq);              // reassemble by submission order
+        let bytes: Vec<u8> = out.into_iter().map(|(_, b)| b).collect();
+        let expected: Vec<u8> = (0..N).map(|n| (n & 0xff) as u8).collect();
+        assert_eq!(bytes, expected, "pipelined bulk stream must reassemble in order");
+
+        drop(pipeline);
+        shutdown.store(true, Ordering::Release);
+        server.join().unwrap();
+    }
+
 }

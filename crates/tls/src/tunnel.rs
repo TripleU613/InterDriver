@@ -3,17 +3,18 @@
 //! `serve` in front of its localhost USB/IP server; the importer runs `forward`
 //! and points the attach/probe command at the local address it prints.
 //!
-//! The pump is single-threaded and non-blocking, so one TLS session is never
-//! touched from two threads (rustls streams are not splittable). One thread per
-//! tunneled connection shuttles bytes both directions until either side closes.
+//! Each tunneled connection is carried by the full-duplex `Duplex` transport and
+//! copied with one blocking thread per direction. An earlier single-threaded
+//! non-blocking pump over rustls `StreamOwned` stalled a large upload across a
+//! high-latency link when the receiving side was the TLS server; the duplex
+//! transport is built to be read and written from two threads at once and does
+//! not have that failure.
 
-use crate::TlsStream;
-use std::io::{self, Read, Write};
+use crate::{Duplex, accept_duplex, connect_duplex};
+use interdriver_transport::Transport;
+use std::io;
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::Arc;
-use std::time::Duration;
-
-const CHUNK: usize = 64 * 1024;
 
 /// Exporter side: accept mTLS on `listener`, and for each connection open a
 /// plain connection to `forward_to` (the localhost USB/IP server) and pump.
@@ -27,13 +28,13 @@ pub fn serve<A: ToSocketAddrs + Clone + Send + 'static>(
         let server_config = Arc::clone(&server_config);
         let forward_to = forward_to.clone();
         std::thread::spawn(move || {
-            let Ok(tls) = crate::accept(server_config, stream) else {
+            let Ok(tls) = accept_duplex(server_config, stream) else {
                 return;
             };
             let Ok(plain) = TcpStream::connect(forward_to) else {
                 return;
             };
-            let _ = pump(tls, plain);
+            let _ = bridge(tls, plain);
         });
     }
     Ok(())
@@ -56,129 +57,53 @@ pub fn forward<A: ToSocketAddrs + Clone + Send + 'static>(
             let Ok(tcp) = TcpStream::connect(remote) else {
                 return;
             };
-            let Ok(tls) = crate::connect(client_config, &server_name, tcp) else {
+            let Ok(tls) = connect_duplex(client_config, &server_name, tcp) else {
                 return;
             };
-            let _ = pump(tls, plain);
+            let _ = bridge(tls, plain);
         });
     }
     Ok(())
 }
 
-/// Stop reading a source once its outbound buffer holds this much unsent data,
-/// so a slow consumer applies backpressure instead of growing memory without
-/// bound during a long transfer (a backup or a large file copy).
-const HIGH_WATER: usize = 4 * 1024 * 1024;
+/// Copies bytes both ways between the encrypted `tls` transport and the plain
+/// `plain` socket until either side closes, one blocking thread per direction.
+/// When one direction ends, both peers are shut down so the other thread also
+/// unblocks and the connection tears down cleanly.
+fn bridge(tls: Duplex, plain: TcpStream) -> io::Result<()> {
+    let tls_read = tls;
+    let tls_write = tls_read.split()?;
+    let plain_read = plain.try_clone()?;
+    let plain_write = plain;
 
-/// A directional byte buffer that advances a read cursor instead of draining
-/// from the front, so a sustained stream never pays repeated O(n) memmoves.
-#[derive(Default)]
-struct Pending {
-    data: Vec<u8>,
-    sent: usize,
-}
-
-impl Pending {
-    fn len(&self) -> usize {
-        self.data.len() - self.sent
+    // plain -> tls (e.g. a large upload)
+    let up = {
+        let mut source = plain_read;
+        let mut sink = tls_write;
+        std::thread::spawn(move || {
+            let _ = io::copy(&mut source, &mut sink);
+            let _ = sink.shutdown();
+            let _ = source.shutdown(std::net::Shutdown::Read);
+        })
+    };
+    // tls -> plain (the reply direction)
+    {
+        let mut source = tls_read;
+        let mut sink = plain_write;
+        let _ = io::copy(&mut source, &mut sink);
+        let _ = sink.shutdown(std::net::Shutdown::Write);
+        let _ = source.shutdown();
     }
-    fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-    fn push(&mut self, bytes: &[u8]) {
-        self.data.extend_from_slice(bytes);
-    }
-    fn advance(&mut self, n: usize) {
-        self.sent += n;
-        if self.sent == self.data.len() {
-            self.data.clear();
-            self.sent = 0;
-        } else if self.sent > CHUNK {
-            self.data.drain(..self.sent);
-            self.sent = 0;
-        }
-    }
-    fn slice(&self) -> &[u8] {
-        &self.data[self.sent..]
-    }
-}
-
-/// Shuttles bytes both directions between a TLS stream and a plain stream until
-/// either closes. Single thread, non-blocking, with backpressure and a short
-/// idle sleep so it never busy-spins and never buffers without bound.
-fn pump(tls: TlsStream, plain: TcpStream) -> io::Result<()> {
-    tls.set_nonblocking(true)?;
-    plain.set_nonblocking(true)?;
-    let mut tls = tls;
-    let mut plain = plain;
-    let mut to_tls = Pending::default();
-    let mut to_plain = Pending::default();
-    let mut plain_eof = false;
-    let mut tls_eof = false;
-
-    loop {
-        let mut progressed = false;
-        let mut buffer = [0_u8; CHUNK];
-
-        if !plain_eof && to_tls.len() < HIGH_WATER {
-            match plain.read(&mut buffer) {
-                Ok(0) => plain_eof = true,
-                Ok(n) => {
-                    to_tls.push(&buffer[..n]);
-                    progressed = true;
-                }
-                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}
-                Err(e) => return Err(e),
-            }
-        }
-        if !tls_eof && to_plain.len() < HIGH_WATER {
-            match tls.read(&mut buffer) {
-                Ok(0) => tls_eof = true,
-                Ok(n) => {
-                    to_plain.push(&buffer[..n]);
-                    progressed = true;
-                }
-                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}
-                Err(e) => return Err(e),
-            }
-        }
-        if !to_tls.is_empty() {
-            match tls.write(to_tls.slice()) {
-                Ok(n) if n > 0 => {
-                    to_tls.advance(n);
-                    let _ = tls.flush();
-                    progressed = true;
-                }
-                Ok(_) => {}
-                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}
-                Err(e) => return Err(e),
-            }
-        }
-        if !to_plain.is_empty() {
-            match plain.write(to_plain.slice()) {
-                Ok(n) if n > 0 => {
-                    to_plain.advance(n);
-                    progressed = true;
-                }
-                Ok(_) => {}
-                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}
-                Err(e) => return Err(e),
-            }
-        }
-
-        if plain_eof && to_tls.is_empty() && tls_eof && to_plain.is_empty() {
-            return Ok(());
-        }
-        if !progressed {
-            std::thread::sleep(Duration::from_millis(1));
-        }
-    }
+    let _ = up.join();
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{Authority, client_config, server_config};
+    use std::io::{Read, Write};
+    use std::time::Duration;
 
     #[test]
     fn streams_a_large_payload_byte_correct_through_the_tunnel() {

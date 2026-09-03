@@ -13,6 +13,8 @@ members = [
     "crates/control-plane",
     "crates/gadget-linux",
     "crates/tls",
+    "crates/relay",
+    "crates/transport",
     "crates/windows-export-abi",
     "xtask",
 ]

@@ -568,3 +568,83 @@ live usbmux and NCM traffic are verified with the Rust KMDF driver. The clean
 session automatically verified the existing manual pairing, reached CoreDevice
 `Available`, and was listed by both Apple Configurator and `cfgutil`. A
 destructive restore/recovery/DFU cycle has not been run on this phone.
+
+## Review-driven changes (2026-09-03)
+
+A POC review raised five points; `docs/review-response.md` answers each. The
+code changes and how far each is verified:
+
+- **Reverse connection + mTLS carrier (points 1, 5) — verified on hardware.**
+  The USB/IP engine now runs over a `Transport` (`crates/transport`) produced by
+  a `Connect`: an `Acceptor` (listen, the old model) or a `Dialer` (dial out).
+  The exporter can therefore dial the importer or a relay, so a workstation
+  behind a customer firewall needs no inbound port. `interdriver-tls` supplies a
+  full-duplex mutually authenticated `Duplex` transport, and the exporter dials
+  inside it. CLI: `--connect <host:port>` (dial out), `--listen <port>` (accept
+  a dial), `--tls <cert-dir>` (wrap in mTLS), on any export/probe command.
+  Proven end to end: this Linux box exported its webcam, dialed out over mTLS to
+  `test-mac` across a Tailscale relay, and the Mac read the real
+  `0c45:6340` device descriptor. Engine tests cover reverse dial, the mTLS
+  handshake, a cross-CA rejection, two-way saturation, and mid-session shutdown.
+
+  Bulk data plane proven both directions on hardware: a 20 MB payload moved
+  byte-correct (SHA-256 matched) through the mTLS tunnel Linux->Mac and
+  Mac->Linux over the Tailscale relay (~1-4 MB/s, relay-bound, direction
+  asymmetric like plain TCP on the same path). Finding along the way: the legacy
+  `tls serve`/`tls forward` proxy stalled a large Mac->Linux upload after ~99
+  bytes because its single-threaded non-blocking rustls `StreamOwned` pump
+  mishandled that direction; it now runs over the full-duplex `Duplex` transport
+  (one blocking thread per direction), which fixed it. Plain TCP on the same
+  path was fine, so this was a tunnel bug, not the network.
+
+- **Restore / survive ungraceful exit (point 3) — logic tested, Windows steps
+  bench-pending.** `cargo xtask windows-export install` now writes a restore
+  manifest to `%ProgramData%\InterDriver\export-state.txt` and registers a boot task
+  before it disturbs the machine; `cargo xtask windows-export restore` reverses
+  every recorded step (re-enable the Apple functions, remove the InterDriver driver,
+  restart Apple Mobile Device Service and Bonjour, delete the firewall rule) and
+  is idempotent. The boot task runs restore automatically after a crash or power
+  loss. Manifest round-trip and pnputil published-name parsing are unit-tested.
+
+- **Pipelining (point 4) — attribution corrected; mechanism tested, wiring
+  deferred.** The exporters already pipeline (KMDF parallel queue; usbfs one
+  thread per URB); the limit was in the importer loops. `Pipeline` in
+  `interdriver-usbip-session` keeps a bounded window in flight and delivers
+  completions in per-endpoint submission order. The exporter-ordering gate is now
+  CLOSED: the shared server runs one worker per endpoint, so same-endpoint
+  transfers are strictly FIFO (submission order preserved end to end) while
+  different endpoints stay concurrent — identical to before for a one-in-flight
+  importer, so the verified macOS/Windows paths are undisturbed. Proven by tests:
+  24 concurrent same-endpoint reads return in submission order, and a
+  300-transfer pipelined bulk stream (window 16) reassembles byte-correct.
+  Flipping the window on inside the Windows/macOS URB loops is the remaining
+  hardware-gated step (needs per-endpoint accounting for idle interrupt reads).
+
+- **Driver stability (point 2) — no code deliverable.** Requires Driver
+  Verifier, HLK, and a soak matrix; the existing CFG-section CI check and the
+  file-cleanup teardown handler remain the current hardening.
+
+The whole workspace builds for Windows (cross) and macOS (on the MacBook); the
+Windows exporter could not be deployed from here because the test box is not
+reachable over SSH in this environment.
+
+## Rendezvous relay — delivered (2026-09-03)
+
+`interdriver-relay` (new crate) and `interdriver-usb relay <port>` implement the
+both-ends-outbound topology from architecture.md: neither the customer's Windows
+PC nor the Mac needs an inbound port. Both dial OUT to a relay over mutually
+authenticated TLS and announce a shared 32-byte rendezvous key (`GRLY` magic +
+role + key, sent before USB/IP); the relay pairs an exporter with an importer on
+the same key and splices their two streams into one byte pipe, never
+interpreting a USB byte. `RelayExporter` (a `Connect`) redials and re-announces
+if the session drops.
+
+CLI: `interdriver-usb relay <port> --tls <dir>`, then on each end add
+`--relay <host:port> --key <hex>`. `tls init` now also issues a `relay`
+identity, which the relay presents and both peers verify.
+
+Verified end to end on hardware: a relay, a usbfs exporter of the local webcam,
+and an importer — three processes, all mutually authenticated over TLS, both
+device-facing ends dialing in — paired through the relay and the importer read
+the real `0c45:6340` device descriptor across the spliced pipe. Engine test
+covers the same flow on loopback.

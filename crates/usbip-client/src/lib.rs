@@ -4,6 +4,7 @@ use interdriver_usbip_protocol::{TICKET_MAGIC,
     INTERFACE_RECORD_LEN, ImportRequest, InterfaceRecord, OP_REP_DEVLIST, OP_REP_IMPORT,
     OP_REQ_DEVLIST, OP_REQ_IMPORT,
 };
+pub use interdriver_transport::{Acceptor, Connect, Dialer, Transport, Wrap, plain};
 use std::fmt;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
@@ -19,25 +20,33 @@ pub struct ListedDevice {
     pub interfaces: Vec<InterfaceRecord>,
 }
 
-#[derive(Debug)]
 pub struct ImportedDevice {
     pub device: DeviceRecord,
-    stream: TcpStream,
+    stream: Box<dyn Transport>,
+}
+
+impl fmt::Debug for ImportedDevice {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ImportedDevice")
+            .field("device", &self.device)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ImportedDevice {
     #[must_use]
-    pub fn into_stream(self) -> TcpStream {
+    pub fn into_stream(self) -> Box<dyn Transport> {
         self.stream
     }
 
     #[must_use]
-    pub const fn stream(&self) -> &TcpStream {
-        &self.stream
+    pub fn stream(&self) -> &dyn Transport {
+        self.stream.as_ref()
     }
 
     #[must_use]
-    pub const fn stream_mut(&mut self) -> &mut TcpStream {
+    pub fn stream_mut(&mut self) -> &mut Box<dyn Transport> {
         &mut self.stream
     }
 }
@@ -117,7 +126,19 @@ pub fn list_with_ticket<A: ToSocketAddrs>(
     timeout: Duration,
     ticket: Option<[u8; 32]>,
 ) -> Result<Vec<ListedDevice>, Error> {
-    let mut stream = connect(address, timeout, ticket)?;
+    let stream = connect(address, timeout)?;
+    list_on(Box::new(stream), timeout, ticket)
+}
+
+/// Lists the devices offered on an already established transport: a dialled
+/// socket, an accepted one, or a TLS session over either.
+pub fn list_on(
+    mut stream: Box<dyn Transport>,
+    timeout: Duration,
+    ticket: Option<[u8; 32]>,
+) -> Result<Vec<ListedDevice>, Error> {
+    stream.set_timeouts(Some(timeout))?;
+    present_ticket(&mut stream, ticket)?;
     stream.write_all(
         &ControlHeader {
             code: OP_REQ_DEVLIST,
@@ -164,7 +185,22 @@ pub fn import_with_ticket<A: ToSocketAddrs>(
     timeout: Duration,
     ticket: Option<[u8; 32]>,
 ) -> Result<ImportedDevice, Error> {
-    let mut stream = connect(address, timeout, ticket)?;
+    let stream = connect(address, timeout)?;
+    import_on(Box::new(stream), bus_id, timeout, ticket)
+}
+
+/// Imports `bus_id` over an already established transport. The USB/IP roles
+/// do not depend on who dialled: the importer always sends the request, so
+/// this works on a socket the exporter connected to us as well as on one we
+/// connected to the exporter.
+pub fn import_on(
+    mut stream: Box<dyn Transport>,
+    bus_id: &str,
+    timeout: Duration,
+    ticket: Option<[u8; 32]>,
+) -> Result<ImportedDevice, Error> {
+    stream.set_timeouts(Some(timeout))?;
+    present_ticket(&mut stream, ticket)?;
     stream.write_all(
         &ControlHeader {
             code: OP_REQ_IMPORT,
@@ -180,16 +216,21 @@ pub fn import_with_ticket<A: ToSocketAddrs>(
     let reply = read_control_header(&mut stream, OP_REP_IMPORT, "import")?;
     ensure_success(reply, "import")?;
     let device = read_device(&mut stream)?;
-    stream.set_read_timeout(None)?;
-    stream.set_write_timeout(None)?;
+    stream.set_timeouts(None)?;
     Ok(ImportedDevice { device, stream })
 }
 
-fn connect<A: ToSocketAddrs>(
-    address: A,
-    timeout: Duration,
-    ticket: Option<[u8; 32]>,
-) -> Result<TcpStream, Error> {
+fn present_ticket(stream: &mut Box<dyn Transport>, ticket: Option<[u8; 32]>) -> io::Result<()> {
+    if let Some(token) = ticket {
+        stream.write_all(&TICKET_MAGIC)?;
+        stream.write_all(&token)?;
+        stream.flush()?;
+    }
+    Ok(())
+}
+
+/// Dials the exporter with a bound on the connect time.
+pub fn connect<A: ToSocketAddrs>(address: A, timeout: Duration) -> Result<TcpStream, Error> {
     let addresses: Vec<SocketAddr> = address.to_socket_addrs()?.collect();
     if addresses.is_empty() {
         return Err(Error::AddressUnavailable);
@@ -197,14 +238,8 @@ fn connect<A: ToSocketAddrs>(
     let mut last_error = None;
     for address in addresses {
         match TcpStream::connect_timeout(&address, timeout) {
-            Ok(mut stream) => {
+            Ok(stream) => {
                 stream.set_nodelay(true)?;
-                stream.set_read_timeout(Some(timeout))?;
-                stream.set_write_timeout(Some(timeout))?;
-                if let Some(token) = ticket {
-                    stream.write_all(&TICKET_MAGIC)?;
-                    stream.write_all(&token)?;
-                }
                 return Ok(stream);
             }
             Err(error) => last_error = Some(error),
@@ -216,7 +251,7 @@ fn connect<A: ToSocketAddrs>(
 }
 
 fn read_control_header(
-    stream: &mut TcpStream,
+    stream: &mut Box<dyn Transport>,
     expected: u16,
     _operation: &'static str,
 ) -> Result<ControlHeader, Error> {
@@ -243,13 +278,13 @@ fn ensure_success(header: ControlHeader, operation: &'static str) -> Result<(), 
     }
 }
 
-fn read_device(stream: &mut TcpStream) -> Result<DeviceRecord, Error> {
+fn read_device(stream: &mut Box<dyn Transport>) -> Result<DeviceRecord, Error> {
     let mut bytes = [0; DEVICE_RECORD_LEN];
     stream.read_exact(&mut bytes)?;
     DeviceRecord::decode(&bytes).map_err(Error::from)
 }
 
-fn read_u32(stream: &mut TcpStream) -> Result<u32, Error> {
+fn read_u32(stream: &mut Box<dyn Transport>) -> Result<u32, Error> {
     let mut bytes = [0; 4];
     stream.read_exact(&mut bytes)?;
     Ok(u32::from_be_bytes(bytes))

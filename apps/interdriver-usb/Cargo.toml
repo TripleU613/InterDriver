@@ -9,6 +9,7 @@ interdriver-driver-core = { path = "../../crates/driver-core" }
 interdriver-usbip-session = { path = "../../crates/usbip-session" }
 interdriver-usbip-client = { path = "../../crates/usbip-client" }
 interdriver-control-plane = { path = "../../crates/control-plane" }
+interdriver-relay = { path = "../../crates/relay" }
 interdriver-tls = { path = "../../crates/tls" }
 
 [target.'cfg(target_os = "linux")'.dependencies]

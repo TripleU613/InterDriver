@@ -7,17 +7,54 @@
 //! in-memory CA, `Identity` is a peer's cert+key signed by it. Real deployments
 //! load these from disk; tests generate them in-process.
 
+mod duplex;
 mod identity;
 mod stream;
 pub mod tunnel;
 
+pub use duplex::{Duplex, accept_duplex, connect_duplex};
 pub use identity::{Authority, Identity, load_ca, load_identity};
 pub use stream::{TlsStream, accept, connect};
 pub use rustls::{ClientConfig, ServerConfig};
 
 use rustls::pki_types::CertificateDer;
 use std::io;
+use std::path::Path;
 use std::sync::Arc;
+
+/// The on-disk layout `tls init` writes: a CA certificate plus one identity
+/// (certificate chain and key) per role, named after the role.
+pub struct Material {
+    pub ca: CertificateDer<'static>,
+    pub identity: Identity,
+}
+
+/// Loads the CA and the identity for `role` (`exporter` or `importer`) from
+/// `dir`.
+pub fn load_material(dir: &Path, role: &str) -> io::Result<Material> {
+    let ca = load_ca(&dir.join("interdriver-ca.pem"))?;
+    let identity = load_identity(&dir.join(format!("{role}.pem")), &dir.join(format!("{role}.key")))?;
+    Ok(Material { ca, identity })
+}
+
+/// The transport wrap for the side that dials: a TLS client that presents its
+/// identity and requires the accepting side to be `server_name`.
+pub fn dial_wrap(material: &Material, server_name: &str) -> io::Result<interdriver_transport::Wrap> {
+    let config = client_config(&material.identity, &material.ca)?;
+    let server_name = server_name.to_owned();
+    Ok(Arc::new(move |tcp: std::net::TcpStream| -> io::Result<Box<dyn interdriver_transport::Transport>> {
+        Ok(Box::new(connect_duplex(Arc::clone(&config), &server_name, tcp)?))
+    }))
+}
+
+/// The transport wrap for the side that accepts: a TLS server that requires a
+/// CA-signed client certificate.
+pub fn accept_wrap(material: &Material) -> io::Result<interdriver_transport::Wrap> {
+    let config = server_config(&material.identity, &material.ca)?;
+    Ok(Arc::new(move |tcp: std::net::TcpStream| -> io::Result<Box<dyn interdriver_transport::Transport>> {
+        Ok(Box::new(accept_duplex(Arc::clone(&config), tcp)?))
+    }))
+}
 
 /// Builds a server config that REQUIRES a client certificate signed by `ca`
 /// (mutual TLS). A peer without a CA-signed certificate cannot complete the

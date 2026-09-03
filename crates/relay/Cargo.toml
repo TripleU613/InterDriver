@@ -1,0 +1,18 @@
+[package]
+name = "interdriver-relay"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+interdriver-transport = { path = "../transport" }
+
+[dev-dependencies]
+interdriver-tls = { path = "../tls" }
+interdriver-usbip-protocol = { path = "../usbip-protocol" }
+interdriver-usbip-server = { path = "../usbip-server" }
+interdriver-usbip-session = { path = "../usbip-session" }
+interdriver-usbip-client = { path = "../usbip-client" }
+
+[lints]
+workspace = true

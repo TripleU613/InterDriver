@@ -6,6 +6,179 @@ use std::time::Duration;
 
 const DEFAULT_PORT: u16 = 3240;
 const DEVICE_DESCRIPTOR_LEN: usize = 18;
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+use interdriver_usbip_client::{Acceptor, Connect, Dialer, Transport, Wrap, plain};
+
+/// How the two ends reach each other, independent of which is exporter and
+/// which is importer. USB/IP still flows importer-first; these options only
+/// decide who opens the TCP connection and whether it is wrapped in mTLS.
+///
+/// - `--connect <host:port>`: this end dials out. On an exporter this is the
+///   reverse model — a workstation behind a customer firewall dials the
+///   importer or a relay, so no inbound port is needed.
+/// - `--listen <port>`: this end accepts the other's dial.
+/// - `--tls <cert-dir>`: wrap the connection in mutually authenticated TLS,
+///   using the identities `tls init` wrote to that directory.
+#[derive(Clone, Default)]
+struct EndpointOpts {
+    connect: Option<String>,
+    listen: Option<u16>,
+    tls: Option<String>,
+    relay: Option<String>,
+    key: Option<[u8; 32]>,
+}
+
+impl EndpointOpts {
+    fn take(args: &mut Vec<String>) -> Result<Self, String> {
+        let connect = take_flag(args, "--connect");
+        let tls = take_flag(args, "--tls");
+        let relay = take_flag(args, "--relay");
+        let key = match take_flag(args, "--key") {
+            Some(hex) => Some(
+                interdriver_control_plane::Token::from_hex(&hex)
+                    .ok_or_else(|| "--key must be 64 hex characters".to_string())?
+                    .as_bytes(),
+            ),
+            None => None,
+        };
+        let listen = match take_flag(args, "--listen") {
+            Some(value) => Some(
+                value
+                    .parse::<u16>()
+                    .map_err(|_| "--listen needs a port from 1 to 65535".to_string())?,
+            ),
+            None => None,
+        };
+        Ok(Self {
+            connect,
+            listen,
+            tls,
+            relay,
+            key,
+        })
+    }
+
+    fn note(&self) -> &'static str {
+        if self.tls.is_some() {
+            " (mutually authenticated TLS)"
+        } else {
+            " (plaintext — keep it on a trusted network)"
+        }
+    }
+}
+
+fn tls_material(role: &str, dir: &str) -> Result<interdriver_tls::Material, String> {
+    interdriver_tls::load_material(std::path::Path::new(dir), role).map_err(|error| error.to_string())
+}
+
+fn dial_wrap(own_role: &str, peer_name: &str, dir: &str) -> Result<Wrap, String> {
+    let material = tls_material(own_role, dir)?;
+    interdriver_tls::dial_wrap(&material, peer_name).map_err(|error| error.to_string())
+}
+
+fn accept_wrap(own_role: &str, dir: &str) -> Result<Wrap, String> {
+    let material = tls_material(own_role, dir)?;
+    interdriver_tls::accept_wrap(&material).map_err(|error| error.to_string())
+}
+
+/// Builds the exporter's connection source. The exporter is `exporter` in the
+/// TLS identity pair, and when it dials out it verifies the importer as
+/// `importer`.
+fn exporter_connect(default_port: u16, opts: &EndpointOpts) -> Result<Box<dyn Connect>, String> {
+    if let Some(relay) = &opts.relay {
+        let key = opts.key.ok_or_else(|| "--relay requires --key <hex>".to_string())?;
+        let wrap = match &opts.tls {
+            Some(dir) => dial_wrap("exporter", "relay", dir)?,
+            None => plain(),
+        };
+        eprintln!("exporter dialling relay {relay}{}; Ctrl-C to stop", opts.note());
+        let dialer =
+            Dialer::new(relay.as_str(), CONNECT_TIMEOUT, wrap).map_err(|error| error.to_string())?;
+        return Ok(Box::new(interdriver_relay::RelayExporter::new(Box::new(dialer), key)));
+    }
+    if let Some(remote) = &opts.connect {
+        let wrap = match &opts.tls {
+            Some(dir) => dial_wrap("exporter", "importer", dir)?,
+            None => plain(),
+        };
+        eprintln!("exporter dialling {remote}{}; Ctrl-C to stop", opts.note());
+        Ok(Box::new(
+            Dialer::new(remote.as_str(), CONNECT_TIMEOUT, wrap).map_err(|error| error.to_string())?,
+        ))
+    } else {
+        let wrap = match &opts.tls {
+            Some(dir) => accept_wrap("exporter", dir)?,
+            None => plain(),
+        };
+        eprintln!(
+            "exporter listening on 0.0.0.0:{default_port}{}; Ctrl-C to stop",
+            opts.note()
+        );
+        Ok(Box::new(
+            Acceptor::bind(("0.0.0.0", default_port), CONNECT_TIMEOUT, wrap)
+                .map_err(|error| error.to_string())?,
+        ))
+    }
+}
+
+fn host_port(remote: &str) -> String {
+    if remote.contains(':') {
+        remote.to_owned()
+    } else {
+        format!("{remote}:{DEFAULT_PORT}")
+    }
+}
+
+/// Builds the importer's transport. The importer is `importer` in the TLS
+/// identity pair; dialing out it verifies the exporter as `exporter`, and
+/// listening it accepts the exporter's dial as a TLS server.
+fn importer_transport(remote: &str, opts: &EndpointOpts) -> Result<Box<dyn Transport>, String> {
+    if let Some(relay) = &opts.relay {
+        let key = opts.key.ok_or_else(|| "--relay requires --key <hex>".to_string())?;
+        let wrap = match &opts.tls {
+            Some(dir) => dial_wrap("importer", "relay", dir)?,
+            None => plain(),
+        };
+        eprintln!("importer dialling relay {relay}{}", opts.note());
+        let dialer =
+            Dialer::new(relay.as_str(), CONNECT_TIMEOUT, wrap).map_err(|error| error.to_string())?;
+        return interdriver_relay::importer_via_relay(Box::new(dialer), key)
+            .map_err(|error| error.to_string());
+    }
+    if let Some(port) = opts.listen {
+        let wrap = match &opts.tls {
+            Some(dir) => accept_wrap("importer", dir)?,
+            None => plain(),
+        };
+        let mut acceptor = Acceptor::bind(("0.0.0.0", port), CONNECT_TIMEOUT, wrap)
+            .map_err(|error| error.to_string())?;
+        eprintln!(
+            "importer waiting for the exporter to dial in on 0.0.0.0:{port}{}",
+            opts.note()
+        );
+        loop {
+            match acceptor.connect() {
+                Ok(transport) => return Ok(transport),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+    } else {
+        if remote.is_empty() {
+            return Err("probe needs a host, or --listen <port> for reverse mode".into());
+        }
+        let wrap = match &opts.tls {
+            Some(dir) => dial_wrap("importer", "exporter", dir)?,
+            None => plain(),
+        };
+        let mut dialer = Dialer::new(host_port(remote).as_str(), CONNECT_TIMEOUT, wrap)
+            .map_err(|error| error.to_string())?;
+        dialer.connect().map_err(|error| error.to_string())
+    }
+}
 
 fn main() -> ExitCode {
     match run(env::args().skip(1).collect()) {
@@ -21,6 +194,7 @@ fn run(mut args: Vec<String>) -> Result<(), String> {
     let ticket = take_ticket(&mut args)?;
     let broker_addr = take_flag(&mut args, "--broker");
     let exporter_id = take_flag(&mut args, "--exporter");
+    let endpoint = EndpointOpts::take(&mut args)?;
     match args.as_slice() {
         [command] if command == "matrix" => {
             print_matrix();
@@ -61,32 +235,32 @@ fn run(mut args: Vec<String>) -> Result<(), String> {
             windows_force_driver(hardware_id, inf)
         }
         [platform, command, remote, bus_id] if platform == "windows" && command == "attach" => {
-            windows_attach(remote, bus_id, ticket)
+            windows_attach(remote, bus_id, ticket, &endpoint)
         }
         [platform, command] if platform == "windows" && command == "detach" => windows_detach(),
         [platform, command, bus_id] if platform == "windows" && command == "export" => {
-            windows_export(bus_id, DEFAULT_PORT)
+            windows_export(bus_id, DEFAULT_PORT, &endpoint)
         }
         [platform, command, bus_id, port] if platform == "windows" && command == "export" => {
             let port = port
                 .parse::<u16>()
                 .map_err(|_| "port must be an integer from 1 to 65535".to_string())?;
-            windows_export(bus_id, port)
+            windows_export(bus_id, port, &endpoint)
         }
         [platform, command, remote, bus_id] if platform == "macos" && command == "attach" => {
             macos_attach(remote, bus_id, ticket)
         }
         [platform, command] if platform == "macos" && command == "list" => macos_list(),
         [platform, command, bus_id] if platform == "macos" && command == "export" => {
-            macos_export(bus_id, DEFAULT_PORT)
+            macos_export(bus_id, DEFAULT_PORT, &endpoint)
         }
         [platform, command, bus_id, port] if platform == "macos" && command == "export" => {
             let port = port
                 .parse::<u16>()
                 .map_err(|_| "port must be an integer from 1 to 65535".to_string())?;
-            macos_export(bus_id, port)
+            macos_export(bus_id, port, &endpoint)
         }
-        [command, remote, bus_id] if command == "probe" => probe(remote, bus_id, ticket),
+        [command, remote, bus_id] if command == "probe" => probe(remote, bus_id, ticket, &endpoint),
         [platform, command, remote, bus_id] if platform == "linux" && command == "gadget" => {
             linux_gadget(remote, bus_id, ticket, "dummy_udc", "dummy_udc.0")
         }
@@ -95,14 +269,15 @@ fn run(mut args: Vec<String>) -> Result<(), String> {
         {
             linux_gadget(remote, bus_id, ticket, driver, device)
         }
+        [command, bus_id] if command == "probe" => probe("", bus_id, ticket, &endpoint),
         [platform, command, bus_id] if platform == "linux" && command == "export" => {
-            linux_export(bus_id, DEFAULT_PORT, ticket, broker_addr, exporter_id)
+            linux_export(bus_id, DEFAULT_PORT, ticket, broker_addr, exporter_id, &endpoint)
         }
         [platform, command, bus_id, port] if platform == "linux" && command == "export" => {
             let port = port
                 .parse::<u16>()
                 .map_err(|_| "port must be an integer from 1 to 65535".to_string())?;
-            linux_export(bus_id, port, ticket, broker_addr, exporter_id)
+            linux_export(bus_id, port, ticket, broker_addr, exporter_id, &endpoint)
         }
         [command, sub, dir] if command == "tls" && sub == "init" => tls_init(dir),
         [command, sub, port, forward, dir] if command == "tls" && sub == "serve" => {
@@ -118,6 +293,12 @@ fn run(mut args: Vec<String>) -> Result<(), String> {
                 .parse::<u16>()
                 .map_err(|_| "port must be an integer from 1 to 65535".to_string())?;
             run_broker(port)
+        }
+        [command, port] if command == "relay" => {
+            let port = port
+                .parse::<u16>()
+                .map_err(|_| "port must be an integer from 1 to 65535".to_string())?;
+            run_relay(port, &endpoint)
         }
         [command, addr] if command == "sessions" => run_sessions(addr),
         [command, addr, token] if command == "revoke" => run_revoke(addr, token),
@@ -179,10 +360,17 @@ fn print_help() {
     println!("  interdriver-usb tls serve <listen-port> <forward-host:port> <cert-dir>");
     println!("  interdriver-usb tls forward <local-port> <remote-host:port> <server-name> <cert-dir>");
     println!("  interdriver-usb broker <port>");
+    println!("  interdriver-usb relay <port> [--tls <cert-dir>]   (both ends dial in with a shared --key)");
     println!("  interdriver-usb issue <broker-addr> <device> <exporter> <importer> [ttl]");
     println!("  interdriver-usb sessions <broker-addr>");
     println!("  interdriver-usb revoke <broker-addr> <token>");
     println!("  interdriver-usb linux export <bus-id> [port] --broker <addr> --exporter <id>");
+    println!();
+    println!("Connection options (any export/probe command):");
+    println!("  --connect <host:port>  exporter dials the importer/relay (reverse mode, no inbound port)");
+    println!("  --listen <port>        importer waits for the exporter to dial in");
+    println!("  --tls <cert-dir>       wrap the link in mutually authenticated TLS (see tls init)");
+    println!("  --relay <host:port> --key <hex>  both ends dial this relay; no inbound port anywhere");
 }
 
 fn tls_init(dir: &str) -> Result<(), String> {
@@ -192,7 +380,8 @@ fn tls_init(dir: &str) -> Result<(), String> {
     ca.save(dir, "interdriver").map_err(|e| e.to_string())?;
     ca.issue_to_files("exporter", dir).map_err(|e| e.to_string())?;
     ca.issue_to_files("importer", dir).map_err(|e| e.to_string())?;
-    println!("wrote interdriver-ca.pem, exporter.pem/.key, importer.pem/.key to {}", dir.display());
+    ca.issue_to_files("relay", dir).map_err(|e| e.to_string())?;
+    println!("wrote interdriver-ca.pem, exporter/importer/relay .pem/.key to {}", dir.display());
     Ok(())
 }
 
@@ -236,6 +425,27 @@ fn run_broker(port: u16) -> Result<(), String> {
     let broker = Arc::new(Mutex::new(interdriver_control_plane::Broker::new()));
     eprintln!("control-plane broker listening on port {port}");
     interdriver_control_plane::net::serve(listener, broker).map_err(|error| error.to_string())
+}
+
+fn run_relay(port: u16, opts: &EndpointOpts) -> Result<(), String> {
+    use std::net::TcpListener;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    let wrap = match &opts.tls {
+        Some(dir) => accept_wrap("relay", dir)?,
+        None => plain(),
+    };
+    let listener =
+        TcpListener::bind(("0.0.0.0", port)).map_err(|error| format!("bind {port}: {error}"))?;
+    let acceptor = interdriver_usbip_client::Acceptor::from_listener(listener, CONNECT_TIMEOUT, wrap)
+        .map_err(|error| error.to_string())?;
+    eprintln!(
+        "rendezvous relay on 0.0.0.0:{port}{}; both ends dial in with a shared --key; Ctrl-C to stop",
+        opts.note()
+    );
+    interdriver_relay::serve(Box::new(acceptor), Arc::new(AtomicBool::new(false)))
+        .map_err(|error| error.to_string())
 }
 
 fn run_sessions(addr: &str) -> Result<(), String> {
@@ -312,10 +522,17 @@ fn take_ticket(args: &mut Vec<String>) -> Result<Option<[u8; 32]>, String> {
     Ok(Some(token.as_bytes()))
 }
 
-fn probe(remote: &str, bus_id: &str, ticket: Option<[u8; 32]>) -> Result<(), String> {
-    let session =
-        Session::connect_with_ticket((remote, DEFAULT_PORT), bus_id, Duration::from_secs(10), ticket)
+fn probe(
+    remote: &str,
+    bus_id: &str,
+    ticket: Option<[u8; 32]>,
+    opts: &EndpointOpts,
+) -> Result<(), String> {
+    let transport = importer_transport(remote, opts)?;
+    let imported =
+        interdriver_usbip_client::import_on(transport, bus_id, Duration::from_secs(10), ticket)
             .map_err(|error| error.to_string())?;
+    let session = Session::from_imported(imported).map_err(|error| error.to_string())?;
     let mut request = TransferRequest::input(0, DEVICE_DESCRIPTOR_LEN);
     request.setup = [0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 0x12, 0x00];
     let completion = session
@@ -427,7 +644,7 @@ impl interdriver_usbip_server::Authorizer for BrokerTicket {
     /// Poll the broker; if the session stops being ACTIVE (an operator revoked
     /// it, or it was released), shut the live connection down so the device is
     /// freed mid-session.
-    fn watch(&self, token: &[u8; 32], connection: std::net::TcpStream) {
+    fn watch(&self, token: &[u8; 32], connection: Box<dyn interdriver_usbip_client::Transport>) {
         let broker = self.broker.clone();
         let hex = interdriver_control_plane::Token::from_bytes(*token).to_hex();
         std::thread::spawn(move || {
@@ -441,7 +658,7 @@ impl interdriver_usbip_server::Authorizer for BrokerTicket {
                     Ok(state) if state == "ACTIVE" || state == "ISSUED" => {}
                     Ok(state) => {
                         eprintln!("session {state}; dropping the connection and releasing the device");
-                        let _ = connection.shutdown(std::net::Shutdown::Both);
+                        let _ = connection.shutdown();
                         return;
                     }
                     Err(_) => {}
@@ -458,36 +675,35 @@ fn linux_export(
     ticket: Option<[u8; 32]>,
     broker: Option<String>,
     exporter: Option<String>,
+    opts: &EndpointOpts,
 ) -> Result<(), String> {
-    use std::net::TcpListener;
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
 
     let provider = Arc::new(interdriver_usbfs_linux::UsbfsProvider::for_device(bus_id));
-    let listener =
-        TcpListener::bind(("0.0.0.0", port)).map_err(|error| format!("bind {port}: {error}"))?;
+    let connect = exporter_connect(port, opts)?;
     let shutdown = Arc::new(AtomicBool::new(false));
     signal_flag(&shutdown)?;
 
+    // The connection banner (dialing vs listening, plaintext vs TLS) is already
+    // printed by exporter_connect; here we only note the authorization mode.
     let authorizer: Option<Arc<dyn interdriver_usbip_server::Authorizer>> = match (broker, ticket) {
         (Some(broker), _) => {
             let exporter = exporter
                 .ok_or_else(|| "--broker requires --exporter <id>".to_string())?;
-            eprintln!(
-                "exporting {bus_id} on port {port} (broker {broker}, exporter {exporter}); Ctrl-C to stop"
-            );
+            eprintln!("exporting {bus_id} (broker {broker}, exporter {exporter})");
             Some(Arc::new(BrokerTicket { broker, exporter }))
         }
         (None, Some(token)) => {
-            eprintln!("exporting {bus_id} on port {port} (fixed ticket); Ctrl-C to stop");
+            eprintln!("exporting {bus_id} (fixed ticket)");
             Some(Arc::new(FixedTicket(interdriver_control_plane::Token::from_bytes(token))))
         }
         (None, None) => {
-            eprintln!("exporting {bus_id} from usbfs on port {port}; press Ctrl-C to stop");
+            eprintln!("exporting {bus_id} from usbfs");
             None
         }
     };
-    interdriver_usbip_server::serve_authorized(listener, provider, shutdown, authorizer)
+    interdriver_usbip_server::serve_via(connect, provider, shutdown, authorizer)
         .map_err(|error| error.to_string())
 }
 
@@ -517,6 +733,7 @@ fn linux_export(
     _ticket: Option<[u8; 32]>,
     _broker: Option<String>,
     _exporter: Option<String>,
+    _opts: &EndpointOpts,
 ) -> Result<(), String> {
     Err("Linux adapter is unavailable on this platform".into())
 }
@@ -682,16 +899,17 @@ fn windows_install_driver(_inf: &str) -> Result<(), String> {
 /// descriptors handed to the driver are the real device's own bytes, fetched
 /// over USB/IP, so Windows enumerates exactly what the far end reports.
 #[cfg(target_os = "windows")]
-fn windows_attach(remote: &str, bus_id: &str, ticket: Option<[u8; 32]>) -> Result<(), String> {
+fn windows_attach(
+    remote: &str,
+    bus_id: &str,
+    ticket: Option<[u8; 32]>,
+    opts: &EndpointOpts,
+) -> Result<(), String> {
     use interdriver_platform_windows::ude;
 
-    let imported = interdriver_usbip_client::import_with_ticket(
-        (remote, DEFAULT_PORT),
-        bus_id,
-        Duration::from_secs(10),
-        ticket,
-    )
-    .map_err(|error| error.to_string())?;
+    let transport = importer_transport(remote, opts)?;
+    let imported = interdriver_usbip_client::import_on(transport, bus_id, Duration::from_secs(10), ticket)
+        .map_err(|error| error.to_string())?;
     let speed = match imported.device.speed {
         1 | 2 => ude::SPEED_FULL,
         5 | 6 => ude::SPEED_SUPER,
@@ -715,9 +933,15 @@ fn windows_attach(remote: &str, bus_id: &str, ticket: Option<[u8; 32]>) -> Resul
         config_descriptor.len()
     );
 
-    // Answer the host's endpoint-0 traffic from the real device until detached.
+    // Serve the host's URBs one at a time. This is deliberately serial: safe
+    // pipelining needs the EXPORTER to preserve per-endpoint submission order,
+    // and today the usbfs and KMDF exporters run each URB concurrently, so two
+    // reads on one bulk pipe can invert and deliver bytes out of order. The
+    // ordered-window mechanism is built and tested as `interdriver_usbip_session::
+    // Pipeline`; wiring it here is gated on that exporter-side ordering. Until
+    // then, one in flight per endpoint keeps a restore byte-correct.
     let controller = ude::Controller::open_default().map_err(|error| error.to_string())?;
-    println!("serving control transfers; press Ctrl-C to detach");
+    println!("serving transfers; press Ctrl-C to detach");
     loop {
         if session.is_closed() {
             eprintln!("exporter closed the session; detaching");
@@ -730,9 +954,9 @@ fn windows_attach(remote: &str, bus_id: &str, ticket: Option<[u8; 32]>) -> Resul
                 break;
             }
         };
-        // Endpoint zero carries a setup packet; every other endpoint is a
-        // plain data transfer whose direction comes from the address.
-        let mut request = if urb.endpoint == 0 {
+        // Endpoint zero carries a setup packet; every other endpoint is a plain
+        // data transfer whose direction comes from the address.
+        let request = if urb.endpoint == 0 {
             let device_to_host = urb.setup[0] & 0x80 != 0;
             let length = usize::from(u16::from_le_bytes([urb.setup[6], urb.setup[7]]));
             let mut request = if device_to_host {
@@ -750,10 +974,9 @@ fn windows_attach(remote: &str, bus_id: &str, ticket: Option<[u8; 32]>) -> Resul
                 TransferRequest::output(number, urb.data.clone())
             }
         };
-        let _ = &mut request;
-        // An idle interrupt or bulk endpoint legitimately has nothing to
-        // report until the device produces data, so it gets the same budget the
-        // exporter allows rather than the short control timeout.
+        // A quiet interrupt or bulk IN legitimately has nothing to report until
+        // the device produces data, so it gets a longer budget than a control
+        // transfer rather than being failed immediately.
         let budget = if urb.endpoint == 0 {
             Duration::from_secs(5)
         } else {
@@ -781,8 +1004,6 @@ fn windows_attach(remote: &str, bus_id: &str, ticket: Option<[u8; 32]>) -> Resul
                 break;
             }
             Err(error) => {
-                // Endpoint zero is named by its setup packet; other endpoints
-                // by address, since their setup is zeroed.
                 if urb.endpoint == 0 {
                     eprintln!(
                         "control {:#04x}/{:#04x} failed: {error}",
@@ -795,9 +1016,9 @@ fn windows_attach(remote: &str, bus_id: &str, ticket: Option<[u8; 32]>) -> Resul
             }
         }
     }
-    // Leaving the device plugged in with nothing serving it strands the host,
-    // so the emulated device is removed on the way out. The driver also does
-    // this from its file-cleanup handler if this process dies outright.
+    // Leaving the device plugged in with nothing serving it strands the host, so
+    // the emulated device is removed on the way out. The driver's file-cleanup
+    // handler does the same if this process dies outright.
     if let Err(error) = ude::unplug(None) {
         eprintln!("detach failed: {error}");
     }
@@ -845,7 +1066,7 @@ fn windows_detach() -> Result<(), String> {
 }
 
 #[cfg(not(target_os = "windows"))]
-fn windows_attach(_r: &str, _b: &str, _t: Option<[u8; 32]>) -> Result<(), String> {
+fn windows_attach(_r: &str, _b: &str, _t: Option<[u8; 32]>, _o: &EndpointOpts) -> Result<(), String> {
     Err("Windows adapter is unavailable on this platform".into())
 }
 
@@ -855,9 +1076,8 @@ fn windows_detach() -> Result<(), String> {
 }
 
 #[cfg(target_os = "windows")]
-fn windows_export(bus_id: &str, port: u16) -> Result<(), String> {
+fn windows_export(bus_id: &str, port: u16, opts: &EndpointOpts) -> Result<(), String> {
     use interdriver_usbip_server::DeviceProvider as _;
-    use std::net::TcpListener;
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
 
@@ -874,15 +1094,14 @@ fn windows_export(bus_id: &str, port: u16) -> Result<(), String> {
             .map_err(|error| format!("start Windows mode-change monitor: {error}"))?;
         Arc::new(driver)
     };
-    let listener =
-        TcpListener::bind(("0.0.0.0", port)).map_err(|error| format!("bind {port}: {error}"))?;
-    eprintln!("exporting {bus_id} on port {port}; press Ctrl-C to stop");
-    interdriver_usbip_server::serve(listener, provider, Arc::new(AtomicBool::new(false)))
+    let connect = exporter_connect(port, opts)?;
+    eprintln!("exporting {bus_id}");
+    interdriver_usbip_server::serve_via(connect, provider, Arc::new(AtomicBool::new(false)), None)
         .map_err(|error| error.to_string())
 }
 
 #[cfg(not(target_os = "windows"))]
-fn windows_export(_bus_id: &str, _port: u16) -> Result<(), String> {
+fn windows_export(_bus_id: &str, _port: u16, _opts: &EndpointOpts) -> Result<(), String> {
     Err("Windows adapter is unavailable on this platform".into())
 }
 
@@ -910,21 +1129,20 @@ fn macos_list() -> Result<(), String> {
 }
 
 #[cfg(target_os = "macos")]
-fn macos_export(bus_id: &str, port: u16) -> Result<(), String> {
-    use std::net::TcpListener;
+fn macos_export(bus_id: &str, port: u16, opts: &EndpointOpts) -> Result<(), String> {
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
 
     let provider = Arc::new(interdriver_platform_macos::exporter::MacProvider::for_device(bus_id));
-    let listener =
-        TcpListener::bind(("0.0.0.0", port)).map_err(|error| format!("bind {port}: {error}"))?;
+    let connect = exporter_connect(port, opts)?;
     let shutdown = Arc::new(AtomicBool::new(false));
     for signal in [signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM] {
         signal_hook::flag::register(signal, Arc::clone(&shutdown))
             .map_err(|error| error.to_string())?;
     }
-    eprintln!("exporting {bus_id} from IOUSBHost on port {port}; press Ctrl-C to stop");
-    interdriver_usbip_server::serve(listener, provider, shutdown).map_err(|error| error.to_string())
+    eprintln!("exporting {bus_id} from IOUSBHost");
+    interdriver_usbip_server::serve_via(connect, provider, shutdown, None)
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -933,7 +1151,7 @@ fn macos_list() -> Result<(), String> {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn macos_export(_bus_id: &str, _port: u16) -> Result<(), String> {
+fn macos_export(_bus_id: &str, _port: u16, _opts: &EndpointOpts) -> Result<(), String> {
     Err("macOS adapter is unavailable on this platform".into())
 }
 

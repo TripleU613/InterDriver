@@ -55,6 +55,7 @@ fn run() -> Result<(), String> {
         [group, command, package_dir] if group == "windows-export" && command == "install" => {
             install(Path::new(package_dir))
         }
+        [group, command] if group == "windows-export" && command == "restore" => restore(),
         [group, command] if group == "windows-ude" && command == "build" => {
             build_ude(&workspace_root()?)
         }
@@ -93,6 +94,7 @@ fn print_help() {
     println!("cargo xtask windows-export build [reference|rust]");
     println!("cargo xtask windows-export package [reference|rust]");
     println!("cargo xtask windows-export sign-test [package-directory]");
+    println!("cargo xtask windows-export restore   (undo install; also runs at boot after a crash)");
     println!("cargo xtask windows-export install [package-directory]");
     println!("cargo xtask windows-ude build|package");
     println!("cargo xtask wdk fetch");
@@ -533,6 +535,103 @@ fn sign_file(signtool: &Path, file: &Path) -> Result<(), String> {
     run_command(&mut command)
 }
 
+const RESTORE_TASK: &str = "InterDriverExportRestore";
+const APPLE_SERVICES: [&str; 2] = ["Apple Mobile Device Service", "Bonjour Service"];
+const APPLE_INTERFACES: [&str; 2] = [
+    r"USB\VID_05AC&PID_12A8&MI_00",
+    r"USB\VID_05AC&PID_12A8&MI_01",
+];
+const FIREWALL_RULE: &str = "InterDriver USB Exporter";
+
+/// Every reversible change `install` made to the machine, persisted so a later
+/// `restore` — including one run by the boot task after a crash or power loss —
+/// can undo exactly what was done and no more. Kept as plain `key=value` lines
+/// so it survives without a serialization dependency and can be read by eye.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct RestoreManifest {
+    services: Vec<String>,
+    interfaces: Vec<String>,
+    inf_published: Option<String>,
+    firewall_rule: Option<String>,
+}
+
+impl RestoreManifest {
+    fn to_text(&self) -> String {
+        let mut out = String::from("# InterDriver export restore manifest\n");
+        for service in &self.services {
+            out.push_str(&format!("service={service}\n"));
+        }
+        for interface in &self.interfaces {
+            out.push_str(&format!("interface={interface}\n"));
+        }
+        if let Some(inf) = &self.inf_published {
+            out.push_str(&format!("inf={inf}\n"));
+        }
+        if let Some(rule) = &self.firewall_rule {
+            out.push_str(&format!("firewall={rule}\n"));
+        }
+        out
+    }
+
+    fn parse(text: &str) -> Self {
+        let mut manifest = Self::default();
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            let value = value.to_owned();
+            match key {
+                "service" => manifest.services.push(value),
+                "interface" => manifest.interfaces.push(value),
+                "inf" => manifest.inf_published = Some(value),
+                "firewall" => manifest.firewall_rule = Some(value),
+                _ => {}
+            }
+        }
+        manifest
+    }
+}
+
+fn state_dir() -> PathBuf {
+    PathBuf::from(env::var_os("ProgramData").unwrap_or_else(|| r"C:\ProgramData".into()))
+        .join("InterDriver")
+}
+
+fn manifest_path() -> PathBuf {
+    state_dir().join("export-state.txt")
+}
+
+/// Runs a command, returning its exit code and captured stdout.
+fn run_capture(command: &mut Command) -> Result<(Option<i32>, String), String> {
+    eprintln!("running {command:?}");
+    let output = command.output().map_err(display_error)?;
+    let text = String::from_utf8_lossy(&output.stdout).into_owned();
+    print!("{text}");
+    Ok((output.status.code(), text))
+}
+
+/// Parses the `Published Name: oemNN.inf` line pnputil prints so restore can
+/// remove exactly the package this install added.
+fn parse_published_inf(output: &str) -> Option<String> {
+    for line in output.lines() {
+        let lower = line.to_ascii_lowercase();
+        if let Some(index) = lower.find("published name") {
+            let rest = &line[index..];
+            if let Some((_, value)) = rest.split_once(':') {
+                let name = value.trim();
+                if name.to_ascii_lowercase().ends_with(".inf") {
+                    return Some(name.to_owned());
+                }
+            }
+        }
+    }
+    None
+}
+
 fn install(package_dir: &Path) -> Result<(), String> {
     let package_dir = fs::canonicalize(package_dir).map_err(display_error)?;
     let inf = package_dir.join("interdriver-export.inf");
@@ -546,30 +645,43 @@ fn install(package_dir: &Path) -> Result<(), String> {
     let pnputil = system_tool("pnputil.exe");
     let netsh = system_tool("netsh.exe");
 
-    for service in ["Apple Mobile Device Service", "Bonjour Service"] {
+    // Record every change as it is made, and persist the manifest and a boot
+    // task BEFORE the disruptive steps, so even a crash between here and the end
+    // leaves the machine recoverable on the next boot.
+    let mut manifest = RestoreManifest::default();
+    if let Err(error) = write_manifest_and_arm_boot_task(&manifest) {
+        eprintln!("warning: could not arm the restore safety net: {error}");
+    }
+
+    for service in APPLE_SERVICES {
         let mut command = Command::new(&sc);
         command.args(["stop", service]);
         run_best_effort(&mut command)?;
+        manifest.services.push(service.to_owned());
     }
     for process in ["interdriver-usb.exe", "interdriver-usb-final.exe"] {
         let mut command = Command::new(&taskkill);
         command.args(["/f", "/im", process]);
         run_best_effort(&mut command)?;
     }
-    for interface in [
-        r"USB\VID_05AC&PID_12A8&MI_00",
-        r"USB\VID_05AC&PID_12A8&MI_01",
-    ] {
+    for interface in APPLE_INTERFACES {
         let mut command = Command::new(&pnputil);
         command.args(["/disable-device", "/deviceid", interface, "/force"]);
         run_best_effort(&mut command)?;
+        manifest.interfaces.push(interface.to_owned());
     }
+    // Re-persist now that we know the services and interfaces we touched.
+    let _ = write_manifest_and_arm_boot_task(&manifest);
+
     let mut add_driver = Command::new(&pnputil);
     add_driver.args(["/add-driver"]).arg(&inf);
-    let code = run_status(&mut add_driver)?;
+    let (code, output) = run_capture(&mut add_driver)?;
     if code != Some(0) && code != Some(3010) {
         return Err(format!("pnputil failed with exit code {code:?}"));
     }
+    manifest.inf_published = parse_published_inf(&output);
+    let _ = write_manifest_and_arm_boot_task(&manifest);
+
     let mut bound = false;
     for mode in [
         r"USB\VID_05AC&PID_12A8",
@@ -591,7 +703,7 @@ fn install(package_dir: &Path) -> Result<(), String> {
         "firewall",
         "delete",
         "rule",
-        "name=InterDriver USB Exporter",
+        &format!("name={FIREWALL_RULE}"),
     ]);
     run_best_effort(&mut delete_rule)?;
     let mut add_rule = Command::new(&netsh);
@@ -600,18 +712,130 @@ fn install(package_dir: &Path) -> Result<(), String> {
         "firewall",
         "add",
         "rule",
-        "name=InterDriver USB Exporter",
+        &format!("name={FIREWALL_RULE}"),
         "dir=in",
         "action=allow",
         "protocol=TCP",
         "localport=3240",
     ]);
     run_command(&mut add_rule)?;
+    manifest.firewall_rule = Some(FIREWALL_RULE.to_owned());
+    let _ = write_manifest_and_arm_boot_task(&manifest);
+
     let mut list = Command::new(&cli);
     list.args(["windows", "list"]);
     run_command(&mut list)?;
     println!("installed package from {}", package_dir.display());
+    println!(
+        "A restore manifest is at {} and a boot task will restore the machine\n\
+         if this process is killed or the machine loses power. To restore now:\n\
+         interdriver-driver-tool.exe windows-export restore",
+        manifest_path().display()
+    );
     println!("Apple and Bonjour services remain stopped while this PC exports the iPhone.");
+    Ok(())
+}
+
+/// Persists the manifest and registers a boot-time restore task. The task runs
+/// a stable copy of this tool, so restore works even if the package directory
+/// is gone. Both are best-effort but logged; the manifest is the source of
+/// truth and the task is the safety net for an ungraceful exit.
+fn write_manifest_and_arm_boot_task(manifest: &RestoreManifest) -> Result<(), String> {
+    let dir = state_dir();
+    fs::create_dir_all(&dir).map_err(display_error)?;
+    fs::write(manifest_path(), manifest.to_text()).map_err(display_error)?;
+
+    // Copy this running tool to a stable location the boot task can invoke.
+    let stable_tool = dir.join("interdriver-driver-tool.exe");
+    if let Ok(current) = env::current_exe()
+        && current != stable_tool
+    {
+        let _ = fs::copy(&current, &stable_tool);
+    }
+    let tool = if stable_tool.is_file() {
+        stable_tool
+    } else {
+        env::current_exe().map_err(display_error)?
+    };
+    let schtasks = system_tool("schtasks.exe");
+    let mut register = Command::new(&schtasks);
+    register.args([
+        "/Create",
+        "/TN",
+        RESTORE_TASK,
+        "/TR",
+        &format!("\"{}\" windows-export restore", tool.display()),
+        "/SC",
+        "ONSTART",
+        "/RU",
+        "SYSTEM",
+        "/F",
+    ]);
+    let _ = run_status(&mut register);
+    Ok(())
+}
+
+/// Reverses everything `install` recorded, in the opposite order, best-effort so
+/// one failing step never blocks the rest. Idempotent: with no manifest it
+/// reports that the machine is already stock and exits successfully, which is
+/// what makes the boot task safe to leave armed and safe to run twice.
+fn restore() -> Result<(), String> {
+    let path = manifest_path();
+    let Ok(text) = fs::read_to_string(&path) else {
+        println!("no InterDriver export state found; machine is already stock");
+        let _ = disarm_boot_task();
+        return Ok(());
+    };
+    let manifest = RestoreManifest::parse(&text);
+    let pnputil = system_tool("pnputil.exe");
+    let netsh = system_tool("netsh.exe");
+    let sc = system_tool("sc.exe");
+
+    if let Some(rule) = &manifest.firewall_rule {
+        let mut command = Command::new(&netsh);
+        command.args([
+            "advfirewall",
+            "firewall",
+            "delete",
+            "rule",
+            &format!("name={rule}"),
+        ]);
+        let _ = run_status(&mut command);
+    }
+    // Removing our driver package unbinds every device forced onto it and lets
+    // Windows fall back to the next-best driver, which is Apple's.
+    if let Some(inf) = &manifest.inf_published {
+        let mut command = Command::new(&pnputil);
+        command.args(["/delete-driver", inf, "/uninstall", "/force"]);
+        let _ = run_status(&mut command);
+    }
+    for interface in &manifest.interfaces {
+        let mut command = Command::new(&pnputil);
+        command.args(["/enable-device", "/deviceid", interface]);
+        let _ = run_status(&mut command);
+    }
+    // Rescan so the Apple functions re-enumerate onto Apple's driver.
+    let mut scan = Command::new(&pnputil);
+    scan.args(["/scan-devices"]);
+    let _ = run_status(&mut scan);
+    for service in &manifest.services {
+        let mut command = Command::new(&sc);
+        command.args(["start", service]);
+        let _ = run_status(&mut command);
+    }
+
+    // Only clear the state once the reversal has been attempted in full.
+    let _ = fs::remove_file(&path);
+    let _ = disarm_boot_task();
+    println!("restored: Apple driver reclaimed, services started, firewall rule removed");
+    Ok(())
+}
+
+fn disarm_boot_task() -> Result<(), String> {
+    let schtasks = system_tool("schtasks.exe");
+    let mut command = Command::new(&schtasks);
+    command.args(["/Delete", "/TN", RESTORE_TASK, "/F"]);
+    let _ = run_status(&mut command);
     Ok(())
 }
 
@@ -1242,4 +1466,48 @@ fn copy(source: &Path, destination: &Path) -> Result<(), String> {
 
 fn display_error(error: impl std::fmt::Display) -> String {
     error.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn manifest_round_trips_through_text() {
+        let manifest = RestoreManifest {
+            services: vec![
+                "Apple Mobile Device Service".into(),
+                "Bonjour Service".into(),
+            ],
+            interfaces: vec![
+                r"USB\VID_05AC&PID_12A8&MI_00".into(),
+                r"USB\VID_05AC&PID_12A8&MI_01".into(),
+            ],
+            inf_published: Some("oem42.inf".into()),
+            firewall_rule: Some("InterDriver USB Exporter".into()),
+        };
+        let parsed = RestoreManifest::parse(&manifest.to_text());
+        assert_eq!(parsed, manifest);
+    }
+
+    #[test]
+    fn manifest_ignores_comments_and_blank_lines() {
+        let text = "# header\n\nservice=Bonjour Service\ninf=oem7.inf\n";
+        let parsed = RestoreManifest::parse(text);
+        assert_eq!(parsed.services, vec!["Bonjour Service".to_string()]);
+        assert_eq!(parsed.inf_published.as_deref(), Some("oem7.inf"));
+        assert!(parsed.interfaces.is_empty());
+        assert!(parsed.firewall_rule.is_none());
+    }
+
+    #[test]
+    fn parses_pnputil_published_name() {
+        let output = "Adding driver package...\r\nDriver package added successfully.\r\nPublished Name:  oem23.inf\r\n";
+        assert_eq!(parse_published_inf(output).as_deref(), Some("oem23.inf"));
+    }
+
+    #[test]
+    fn published_name_absent_is_none() {
+        assert_eq!(parse_published_inf("no useful output here"), None);
+    }
 }

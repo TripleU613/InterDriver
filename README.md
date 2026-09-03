@@ -88,10 +88,18 @@ interdriver-driver-tool.exe windows-export install .
 
 The Rust tool stops the Apple services, disables their open composite functions,
 forces the KMDF driver onto the physical parent, and creates the inbound
-firewall rule. `interdriver-usb windows list` then prints a stable `win-...` bus id.
-Keep the Apple services stopped while exporting. To restore local Apple access,
-uninstall the InterDriver parent driver in Device Manager, scan for hardware
-changes, re-enable the Apple functions, and start the two services.
+firewall rule. It also writes a restore manifest and arms a boot task, so a
+crash, a kill, or power loss puts the machine back to stock on the next boot.
+`interdriver-usb windows list` then prints a stable `win-...` bus id. To restore
+local Apple access at any time, one command reverses everything the install did:
+
+```text
+interdriver-driver-tool.exe windows-export restore
+```
+
+It re-enables the Apple functions, removes the InterDriver driver, restarts Apple
+Mobile Device Service and Bonjour, and deletes the firewall rule. It is safe to
+run twice and safe to run on a machine that is already stock.
 
 ### 3. Windows: export it
 
@@ -197,10 +205,38 @@ interdriver-usb sessions 10.0.0.5:9000                         # who holds what
 interdriver-usb revoke  10.0.0.5:9000 <token>                  # cut a session off
 ```
 
-**mTLS** — both planes can run inside a mutually authenticated tunnel.
+**Reverse connection** — the machine with the device dials out instead of
+listening, so a workstation behind a customer firewall needs no inbound port.
+Add `--connect <host:port>` to any export command and `--listen <port>` to the
+importer. USB/IP still flows importer-first; only who opens the socket changes.
+
+**mTLS as the carrier** — add `--tls <cert-dir>` to both ends and the link is a
+mutually authenticated, encrypted channel: each side presents a CA-signed
+certificate and refuses a peer signed by anyone else. This is the recommended
+way to run off a trusted LAN, and it composes with the reverse connection.
+
+**Rendezvous relay** — for a fleet, neither end may be reachable. Run a relay
+somewhere both can reach, and both the device host and the Mac dial OUT to it
+with a shared key; the relay pairs them and no machine needs an inbound port.
 
 ```bash
-interdriver-usb tls init ./certs
+interdriver-usb relay 9443 --tls ./certs                               # somewhere both ends can reach
+interdriver-usb windows export <bus-id> --relay relay-host:9443 --key <hex> --tls ./certs
+interdriver-usb probe <bus-id> --relay relay-host:9443 --key <hex> --tls ./certs
+```
+
+```bash
+interdriver-usb tls init ./certs                                       # once; copy ./certs to both ends
+# importer (e.g. the Mac side) waits for the device host to dial in:
+interdriver-usb probe <ignored> <bus-id> --listen 3240 --tls ./certs
+# device host dials out over mTLS:
+interdriver-usb windows export <bus-id> --connect importer-host:3240 --tls ./certs
+```
+
+The older `tls serve`/`tls forward` local proxies still exist for wrapping a
+plain USB/IP endpoint without changing its command line:
+
+```bash
 interdriver-usb tls serve   3241 127.0.0.1:3240 ./certs        # exporter side
 interdriver-usb tls forward 3240 exporter-host:3241 exporter ./certs   # importer side
 ```

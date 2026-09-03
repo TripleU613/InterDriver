@@ -144,13 +144,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "interdriver-relay"
+version = "0.1.0"
+dependencies = [
+ "interdriver-tls",
+ "interdriver-transport",
+ "interdriver-usbip-client",
+ "interdriver-usbip-protocol",
+ "interdriver-usbip-server",
+ "interdriver-usbip-session",
+]
+
+[[package]]
 name = "interdriver-tls"
 version = "0.1.0"
 dependencies = [
+ "interdriver-transport",
  "rcgen",
  "rustls",
  "rustls-pemfile",
 ]
+
+[[package]]
+name = "interdriver-transport"
+version = "0.1.0"
 
 [[package]]
 name = "interdriver-usb"
@@ -162,6 +179,7 @@ dependencies = [
  "interdriver-platform-linux",
  "interdriver-platform-macos",
  "interdriver-platform-windows",
+ "interdriver-relay",
  "interdriver-tls",
  "interdriver-usbfs-linux",
  "interdriver-usbip-client",
@@ -183,6 +201,7 @@ dependencies = [
 name = "interdriver-usbip-client"
 version = "0.1.0"
 dependencies = [
+ "interdriver-transport",
  "interdriver-usbip-protocol",
 ]
 
@@ -194,6 +213,7 @@ version = "0.1.0"
 name = "interdriver-usbip-server"
 version = "0.1.0"
 dependencies = [
+ "interdriver-transport",
  "interdriver-usbip-client",
  "interdriver-usbip-protocol",
  "interdriver-usbip-session",

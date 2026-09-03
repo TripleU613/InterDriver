@@ -1,4 +1,4 @@
-use interdriver_usbip_client::ImportedDevice;
+use interdriver_usbip_client::{ImportedDevice, Transport};
 use interdriver_usbip_protocol::{
     BasicHeader, Command, Direction, ISO_DESCRIPTOR_LEN, IsoPacketDescriptor, MAX_ISO_PACKETS,
     Submit, SubmitReply, URB_HEADER_LEN, Unlink, UnlinkReply, UrbHeader,
@@ -6,7 +6,7 @@ use interdriver_usbip_protocol::{
 use std::collections::HashMap;
 use std::fmt;
 use std::io::{self, Read, Write};
-use std::net::{Shutdown, ToSocketAddrs};
+use std::net::ToSocketAddrs;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -192,7 +192,7 @@ struct PendingUnlinkEntry {
 }
 
 struct Shared {
-    writer: Mutex<std::net::TcpStream>,
+    writer: Mutex<Box<dyn Transport>>,
     submits: Mutex<HashMap<u32, PendingSubmitEntry>>,
     unlinks: Mutex<HashMap<u32, PendingUnlinkEntry>>,
     next_sequence: AtomicU32,
@@ -227,7 +227,7 @@ impl Session {
     pub fn from_imported(imported: ImportedDevice) -> Result<Self, Error> {
         let device_id = imported.device.device_id();
         let reader = imported.into_stream();
-        let writer = reader.try_clone()?;
+        let writer = reader.split()?;
         let shared = Arc::new(Shared {
             writer: Mutex::new(writer),
             submits: Mutex::new(HashMap::new()),
@@ -359,7 +359,7 @@ impl Drop for Session {
             && let Ok(writer) = self.shared.writer.lock()
         {
             self.shared.closed.store(true, Ordering::Release);
-            let _ = writer.shutdown(Shutdown::Both);
+            let _ = writer.shutdown();
         }
     }
 }
@@ -367,7 +367,7 @@ impl Drop for Session {
 impl Drop for Shared {
     fn drop(&mut self) {
         if let Ok(writer) = self.writer.lock() {
-            let _ = writer.shutdown(Shutdown::Both);
+            let _ = writer.shutdown();
         }
     }
 }
@@ -396,7 +396,7 @@ fn validate_request(request: &TransferRequest) -> Result<(), Error> {
     Ok(())
 }
 
-fn reader_loop(mut reader: std::net::TcpStream, shared: &Arc<Shared>) {
+fn reader_loop(mut reader: Box<dyn Transport>, shared: &Arc<Shared>) {
     let result: Result<(), TransferError> = loop {
         let mut bytes = [0; URB_HEADER_LEN];
         if let Err(error) = reader.read_exact(&mut bytes) {
@@ -424,7 +424,7 @@ fn reader_loop(mut reader: std::net::TcpStream, shared: &Arc<Shared>) {
 }
 
 fn read_submit_reply(
-    reader: &mut std::net::TcpStream,
+    reader: &mut Box<dyn Transport>,
     shared: &Arc<Shared>,
     reply: SubmitReply,
 ) -> Result<(), TransferError> {
@@ -524,6 +524,184 @@ fn lock_transfer<T>(mutex: &Mutex<T>) -> Result<MutexGuard<'_, T>, TransferError
     mutex
         .lock()
         .map_err(|_| TransferError::Connection("session lock poisoned".into()))
+}
+
+/// A bounded, per-endpoint-ordered window of in-flight transfers.
+///
+/// The session engine already lets many transfers be outstanding at once — the
+/// reader matches each reply to its request by sequence number. What it does
+/// not do on its own is bound how many are in flight or put completions back in
+/// order, and a USB importer needs both: many outstanding to hide the network
+/// round trip, but a single pipe's reads delivered to the host in the order
+/// they were issued, because a reordered bulk stream is a corrupted transfer.
+///
+/// `Pipeline` sits on top of a `Session` and gives exactly that. A caller
+/// submits transfers tagged with an endpoint and an opaque token; the pipeline
+/// keeps at most `window` outstanding across all endpoints, and delivers each
+/// completion through the callback **in submission order within its endpoint**.
+/// Different endpoints never block each other: a slow bulk IN does not hold up a
+/// control transfer. `submit` blocks only when the whole window is full, which
+/// is the backpressure that keeps memory bounded during a multi-gigabyte
+/// restore.
+pub struct Pipeline<T: Send + 'static> {
+    session: Session,
+    window: usize,
+    inflight: Arc<(Mutex<usize>, std::sync::Condvar)>,
+    issued: HashMap<u32, u64>,
+    done_tx: Option<mpsc::Sender<Slot<T>>>,
+    dispatcher: Option<thread::JoinHandle<()>>,
+}
+
+struct Slot<T> {
+    endpoint: u32,
+    seq: u64,
+    token: T,
+    result: Result<TransferCompletion, TransferError>,
+}
+
+impl<T: Send + 'static> Pipeline<T> {
+    /// Builds a pipeline over `session` holding at most `window` transfers in
+    /// flight. `on_complete(endpoint, token, result)` is called from a single
+    /// internal thread, once per submitted transfer, in per-endpoint submission
+    /// order — so a caller may drive a device's completion API from inside it
+    /// without any ordering of its own.
+    pub fn new(
+        session: Session,
+        window: usize,
+        on_complete: impl FnMut(u32, T, Result<TransferCompletion, TransferError>) + Send + 'static,
+    ) -> Self {
+        let window = window.max(1);
+        let inflight = Arc::new((Mutex::new(0_usize), std::sync::Condvar::new()));
+        let (done_tx, done_rx) = mpsc::channel::<Slot<T>>();
+        let dispatcher_inflight = Arc::clone(&inflight);
+        let dispatcher = thread::Builder::new()
+            .name("interdriver-usbip-pipeline".into())
+            .spawn(move || dispatch(done_rx, dispatcher_inflight, on_complete))
+            .expect("spawn pipeline dispatcher");
+        Self {
+            session,
+            window,
+            inflight,
+            issued: HashMap::new(),
+            done_tx: Some(done_tx),
+            dispatcher: Some(dispatcher),
+        }
+    }
+
+    /// Submits one transfer on `endpoint`, tagged with `token`. Blocks while the
+    /// window is full, then returns as soon as the request is on the wire; the
+    /// result arrives later through the completion callback.
+    pub fn submit(
+        &mut self,
+        endpoint: u32,
+        token: T,
+        request: TransferRequest,
+    ) -> Result<(), Error> {
+        {
+            let (lock, condvar) = &*self.inflight;
+            let mut count = lock.lock().map_err(|_| Error::LockPoisoned)?;
+            while *count >= self.window {
+                count = condvar.wait(count).map_err(|_| Error::LockPoisoned)?;
+            }
+            *count += 1;
+        }
+        let seq = {
+            let slot = self.issued.entry(endpoint).or_insert(0);
+            let value = *slot;
+            *slot += 1;
+            value
+        };
+        let pending = match self.session.submit(request) {
+            Ok(pending) => pending,
+            Err(error) => {
+                self.release_slot();
+                return Err(error);
+            }
+        };
+        let done_tx = self
+            .done_tx
+            .clone()
+            .expect("pipeline used after close");
+        thread::Builder::new()
+            .name(format!("interdriver-usbip-wait-{endpoint}-{seq}"))
+            .spawn(move || {
+                let result = pending.wait();
+                let _ = done_tx.send(Slot {
+                    endpoint,
+                    seq,
+                    token,
+                    result,
+                });
+            })
+            .map_err(Error::Io)?;
+        Ok(())
+    }
+
+    fn release_slot(&self) {
+        let (lock, condvar) = &*self.inflight;
+        if let Ok(mut count) = lock.lock() {
+            *count = count.saturating_sub(1);
+            condvar.notify_all();
+        }
+    }
+
+    /// Number of transfers currently in flight.
+    #[must_use]
+    pub fn inflight(&self) -> usize {
+        self.inflight.0.lock().map(|count| *count).unwrap_or(0)
+    }
+
+    /// Blocks until every submitted transfer has been completed and delivered.
+    pub fn drain(&self) {
+        let (lock, condvar) = &*self.inflight;
+        if let Ok(mut count) = lock.lock() {
+            while *count > 0 {
+                count = match condvar.wait(count) {
+                    Ok(guard) => guard,
+                    Err(_) => return,
+                };
+            }
+        }
+    }
+}
+
+impl<T: Send + 'static> Drop for Pipeline<T> {
+    fn drop(&mut self) {
+        self.drain();
+        // Close the channel so the dispatcher finishes, then join it.
+        self.done_tx = None;
+        if let Some(handle) = self.dispatcher.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// The single dispatcher thread: reorders completions per endpoint and calls the
+/// callback in submission order, releasing a window slot as each is delivered.
+fn dispatch<T: Send + 'static>(
+    done_rx: mpsc::Receiver<Slot<T>>,
+    inflight: Arc<(Mutex<usize>, std::sync::Condvar)>,
+    mut on_complete: impl FnMut(u32, T, Result<TransferCompletion, TransferError>) + Send + 'static,
+) {
+    let mut next_emit: HashMap<u32, u64> = HashMap::new();
+    let mut buffered: HashMap<u32, HashMap<u64, Slot<T>>> = HashMap::new();
+    for slot in done_rx {
+        let endpoint = slot.endpoint;
+        buffered.entry(endpoint).or_default().insert(slot.seq, slot);
+        let wanted = next_emit.entry(endpoint).or_insert(0);
+        while let Some(ready) = buffered
+            .get_mut(&endpoint)
+            .and_then(|per_endpoint| per_endpoint.remove(wanted))
+        {
+            on_complete(ready.endpoint, ready.token, ready.result);
+            *wanted += 1;
+            let (lock, condvar) = &*inflight;
+            if let Ok(mut count) = lock.lock() {
+                *count = count.saturating_sub(1);
+                condvar.notify_all();
+            }
+        }
+    }
 }
 
 #[cfg(test)]
