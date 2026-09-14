@@ -21,6 +21,12 @@ fn main() -> ExitCode {
 
 fn run() -> Result<(), String> {
     let args: Vec<String> = env::args().skip(1).collect();
+    // `windows-export run <dir> -- <export args...>` takes a variable tail.
+    if args.len() >= 3 && args[0] == "windows-export" && args[1] == "run" {
+        let tail = args.iter().position(|a| a == "--").unwrap_or(args.len());
+        let export_args: Vec<String> = args.get(tail + 1..).unwrap_or(&[]).to_vec();
+        return run_session(Path::new(&args[2]), &export_args);
+    }
     match args.as_slice() {
         [group, command] if group == "windows-export" && command == "build" => {
             let root = workspace_root()?;
@@ -56,6 +62,10 @@ fn run() -> Result<(), String> {
             install(Path::new(package_dir))
         }
         [group, command] if group == "windows-export" && command == "restore" => restore(),
+        [group, command, pid] if group == "windows-export" && command == "watchdog" => {
+            let pid = pid.parse::<u32>().map_err(|_| "watchdog needs a pid".to_string())?;
+            watchdog(pid)
+        }
         [group, command] if group == "windows-ude" && command == "build" => {
             build_ude(&workspace_root()?)
         }
@@ -94,7 +104,8 @@ fn print_help() {
     println!("cargo xtask windows-export build [reference|rust]");
     println!("cargo xtask windows-export package [reference|rust]");
     println!("cargo xtask windows-export sign-test [package-directory]");
-    println!("cargo xtask windows-export restore   (undo install; also runs at boot after a crash)");
+    println!("cargo xtask windows-export restore   (undo install; logs to %ProgramData%\\InterDriver\\restore.log + Event Log)");
+    println!("cargo xtask windows-export run <package-dir> -- <export args>  (install, export, ALWAYS restore on exit)");
     println!("cargo xtask windows-export install [package-directory]");
     println!("cargo xtask windows-ude build|package");
     println!("cargo xtask wdk fetch");
@@ -605,6 +616,79 @@ fn manifest_path() -> PathBuf {
     state_dir().join("export-state.txt")
 }
 
+fn restore_log_path() -> PathBuf {
+    state_dir().join("restore.log")
+}
+
+/// Appends one timestamped line to the persistent restore log AND prints it, so
+/// there is always a user-visible trail — including from the boot task, which
+/// otherwise runs with no console at all.
+fn log_line(message: &str) {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let line = format!("[{stamp}] {message}\n");
+    print!("{line}");
+    if fs::create_dir_all(state_dir()).is_ok() {
+        use std::io::Write as _;
+        if let Ok(mut file) = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(restore_log_path())
+        {
+            let _ = file.write_all(line.as_bytes());
+        }
+    }
+}
+
+/// Writes a Windows Application Event Log entry (best effort) so a restore that
+/// ran unattended — the boot task — is visible in Event Viewer, not only in a
+/// file the user does not know to look for.
+fn event_log(error: bool, message: &str) {
+    let mut command = Command::new(system_tool("eventcreate.exe"));
+    command.args([
+        "/T",
+        if error { "ERROR" } else { "INFORMATION" },
+        "/ID",
+        "1",
+        "/L",
+        "APPLICATION",
+        "/SO",
+        "InterDriverUSB",
+        "/D",
+        message,
+    ]);
+    let _ = command.output();
+}
+
+/// Runs one restore step, logging its outcome; returns whether it succeeded.
+fn restore_step(label: &str, command: &mut Command) -> bool {
+    match command.output() {
+        Ok(output) => {
+            let ok = output.status.success();
+            let detail = String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .chain(String::from_utf8_lossy(&output.stderr).lines())
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .take(2)
+                .collect::<Vec<_>>()
+                .join(" | ");
+            log_line(&format!(
+                "{} {label}{}",
+                if ok { "ok  " } else { "FAIL" },
+                if detail.is_empty() { String::new() } else { format!(" -- {detail}") }
+            ));
+            ok
+        }
+        Err(error) => {
+            log_line(&format!("FAIL {label} -- could not run: {error}"));
+            false
+        }
+    }
+}
+
 /// Runs a command, returning its exit code and captured stdout.
 fn run_capture(command: &mut Command) -> Result<(Option<i32>, String), String> {
     eprintln!("running {command:?}");
@@ -775,60 +859,172 @@ fn write_manifest_and_arm_boot_task(manifest: &RestoreManifest) -> Result<(), St
     Ok(())
 }
 
-/// Reverses everything `install` recorded, in the opposite order, best-effort so
-/// one failing step never blocks the rest. Idempotent: with no manifest it
-/// reports that the machine is already stock and exits successfully, which is
-/// what makes the boot task safe to leave armed and safe to run twice.
+/// Reverses everything `install` recorded, in the opposite order. Every step is
+/// attempted even if an earlier one fails, every outcome is logged to
+/// `%ProgramData%\InterDriver\restore.log` and to the Application Event Log, and
+/// the exit status reflects whether the machine is actually back to stock — so a
+/// failure is never silent, whether run by hand or by the boot task.
+/// Idempotent: with no manifest it reports the machine is already stock.
 fn restore() -> Result<(), String> {
     let path = manifest_path();
     let Ok(text) = fs::read_to_string(&path) else {
-        println!("no InterDriver export state found; machine is already stock");
+        log_line("restore: no InterDriver export state found; machine is already stock");
         let _ = disarm_boot_task();
         return Ok(());
     };
+    log_line("restore: starting (reversing the recorded install steps)");
     let manifest = RestoreManifest::parse(&text);
     let pnputil = system_tool("pnputil.exe");
     let netsh = system_tool("netsh.exe");
     let sc = system_tool("sc.exe");
+    let mut failures: Vec<String> = Vec::new();
 
     if let Some(rule) = &manifest.firewall_rule {
         let mut command = Command::new(&netsh);
-        command.args([
-            "advfirewall",
-            "firewall",
-            "delete",
-            "rule",
-            &format!("name={rule}"),
-        ]);
-        let _ = run_status(&mut command);
+        command.args(["advfirewall", "firewall", "delete", "rule", &format!("name={rule}")]);
+        if !restore_step(&format!("remove firewall rule '{rule}'"), &mut command) {
+            failures.push("firewall rule".into());
+        }
     }
     // Removing our driver package unbinds every device forced onto it and lets
     // Windows fall back to the next-best driver, which is Apple's.
     if let Some(inf) = &manifest.inf_published {
         let mut command = Command::new(&pnputil);
         command.args(["/delete-driver", inf, "/uninstall", "/force"]);
-        let _ = run_status(&mut command);
+        if !restore_step(&format!("remove InterDriver driver package {inf}"), &mut command) {
+            failures.push(format!("driver package {inf}"));
+        }
     }
     for interface in &manifest.interfaces {
         let mut command = Command::new(&pnputil);
         command.args(["/enable-device", "/deviceid", interface]);
-        let _ = run_status(&mut command);
+        if !restore_step(&format!("re-enable Apple function {interface}"), &mut command) {
+            failures.push(format!("enable {interface}"));
+        }
     }
-    // Rescan so the Apple functions re-enumerate onto Apple's driver.
     let mut scan = Command::new(&pnputil);
     scan.args(["/scan-devices"]);
-    let _ = run_status(&mut scan);
+    restore_step("rescan devices so Apple's driver reclaims the phone", &mut scan);
     for service in &manifest.services {
         let mut command = Command::new(&sc);
         command.args(["start", service]);
-        let _ = run_status(&mut command);
+        if !restore_step(&format!("start service '{service}'"), &mut command) {
+            failures.push(format!("service {service}"));
+        }
     }
 
-    // Only clear the state once the reversal has been attempted in full.
-    let _ = fs::remove_file(&path);
-    let _ = disarm_boot_task();
-    println!("restored: Apple driver reclaimed, services started, firewall rule removed");
-    Ok(())
+    if failures.is_empty() {
+        let _ = fs::remove_file(&path);
+        let _ = disarm_boot_task();
+        log_line("restore: SUCCESS -- Apple driver reclaimed, services started, firewall rule removed");
+        event_log(false, "InterDriver USB exporter restore succeeded; the iPhone is available to Apple software again.");
+        Ok(())
+    } else {
+        // Keep the manifest so the boot task retries, and say loudly what is
+        // still wrong and how to retry by hand.
+        let summary = failures.join(", ");
+        log_line(&format!(
+            "restore: INCOMPLETE -- failed: {summary}. State kept for retry. \
+             Run `interdriver-driver-tool.exe windows-export restore` again, or see {}",
+            restore_log_path().display()
+        ));
+        event_log(true, &format!(
+            "InterDriver USB exporter restore INCOMPLETE ({summary}). Run 'interdriver-driver-tool.exe windows-export restore'. Log: {}",
+            restore_log_path().display()
+        ));
+        Err(format!("restore incomplete: {summary}"))
+    }
+}
+
+/// The product flow in one command: install, run the exporter, and ALWAYS
+/// restore when it ends — normal exit, Ctrl-C, or an exporter crash. A detached
+/// watchdog covers the remaining case where this tool itself is killed, so
+/// recovery never has to wait for a reboot. Usage:
+/// `windows-export run <package-dir> -- <interdriver-usb windows export args...>`
+fn run_session(package_dir: &Path, export_args: &[String]) -> Result<(), String> {
+    install(package_dir)?;
+    let package_dir = fs::canonicalize(package_dir).map_err(display_error)?;
+    let cli = package_dir.join("interdriver-usb.exe");
+    require_file(&cli)?;
+
+    // Detached watchdog: if THIS process dies (killed, crashed), it restores.
+    spawn_watchdog(std::process::id());
+
+    let interrupted = Arc::new(AtomicBool::new(false));
+    install_interrupt_handler(&interrupted)?;
+    log_line(&format!("run: starting exporter {}", export_args.join(" ")));
+    let mut child = Command::new(&cli)
+        .args(["windows", "export"])
+        .args(export_args)
+        .spawn()
+        .map_err(display_error)?;
+    let outcome = loop {
+        if let Some(status) = child.try_wait().map_err(display_error)? {
+            break if status.success() {
+                Ok(())
+            } else {
+                Err(format!("exporter exited with {status}"))
+            };
+        }
+        if interrupted.load(Ordering::SeqCst) {
+            let _ = child.kill();
+            let _ = child.wait();
+            break Ok(());
+        }
+        thread::sleep(Duration::from_millis(200));
+    };
+    log_line("run: exporter ended; restoring the machine now (no reboot needed)");
+    let restored = restore();
+    outcome.and(restored)
+}
+
+/// Waits for `pid` to exit, then restores if the machine is still in the
+/// exported state. Runs as a detached process so it survives the tool being
+/// killed; it ignores Ctrl-C for the same reason.
+fn watchdog(pid: u32) -> Result<(), String> {
+    let _ = ctrlc::set_handler(|| {});
+    log_line(&format!("watchdog: watching pid {pid}"));
+    while process_alive(pid) {
+        thread::sleep(Duration::from_secs(2));
+    }
+    if manifest_path().is_file() {
+        log_line(&format!("watchdog: pid {pid} exited with the machine still exported; restoring"));
+        restore()
+    } else {
+        log_line(&format!("watchdog: pid {pid} exited cleanly; nothing to restore"));
+        Ok(())
+    }
+}
+
+/// Whether a Windows process id is still running (via tasklist CSV output).
+fn process_alive(pid: u32) -> bool {
+    let output = Command::new(system_tool("tasklist.exe"))
+        .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
+        .output();
+    match output {
+        Ok(output) => String::from_utf8_lossy(&output.stdout).lines().any(|line| {
+            // "name","pid",... -- second CSV field is the pid
+            line.split(',').nth(1).map(|f| f.trim_matches('"')) == Some(&pid.to_string())
+        }),
+        Err(_) => false,
+    }
+}
+
+fn spawn_watchdog(pid: u32) {
+    let Ok(current) = env::current_exe() else { return };
+    let mut command = Command::new(current);
+    command.args(["windows-export", "watchdog", &pid.to_string()]);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+    }
+    match command.spawn() {
+        Ok(_) => log_line(&format!("run: watchdog armed for pid {pid}")),
+        Err(error) => log_line(&format!("run: could not arm watchdog: {error}")),
+    }
 }
 
 fn disarm_boot_task() -> Result<(), String> {

@@ -351,19 +351,35 @@ struct Pending {
     endpoint: u32,
 }
 
+/// Per-connection transfer bookkeeping, under one lock so that "is this
+/// transfer still wanted?" and "is it the one currently running on its
+/// endpoint?" are decided atomically against the worker starting it.
+#[derive(Default)]
+struct Book {
+    /// Every transfer the host has submitted and not yet been answered for.
+    pending: HashMap<u32, Pending>,
+    /// The sequence currently executing on each endpoint's worker, if any.
+    running: HashMap<u32, u32>,
+}
+
+/// Per-endpoint queue depth. Bounded so a fast importer cannot push the
+/// exporter out of memory; a full queue blocks the reader, which is ordinary
+/// TCP backpressure onto the importer rather than unbounded growth.
+const ENDPOINT_QUEUE_DEPTH: usize = 32;
+
 fn transfer_loop(reader: Box<dyn Transport>, device: Arc<dyn DeviceSession>) -> io::Result<()> {
     let writer = Arc::new(Mutex::new(reader.split()?));
     let mut reader = reader;
-    let pending = Arc::new(Mutex::new(HashMap::<u32, Pending>::new()));
-    let result = transfer_loop_inner(&mut reader, &device, &writer, &pending);
+    let book = Arc::new(Mutex::new(Book::default()));
+    let result = transfer_loop_inner(&mut reader, &device, &writer, &book);
 
     // A dead USB/IP connection cannot deliver completions for its outstanding
     // transfers. Abort every endpoint still owned by this connection so those
     // backend requests cannot survive into the next import and consume data
     // meant for the replacement session (notably usbmux's one-shot reply).
-    let endpoints = lock(&pending)
-        .map(|mut pending| {
-            pending
+    let endpoints = lock(&book)
+        .map(|mut book| {
+            book.pending
                 .drain()
                 .map(|(_, request)| request.endpoint)
                 .collect::<HashSet<_>>()
@@ -381,7 +397,7 @@ fn transfer_loop_inner(
     reader: &mut Box<dyn Transport>,
     device: &Arc<dyn DeviceSession>,
     writer: &Arc<Mutex<Box<dyn Transport>>>,
-    pending: &Arc<Mutex<HashMap<u32, Pending>>>,
+    book: &Arc<Mutex<Book>>,
 ) -> io::Result<()> {
     // One worker thread per endpoint. Same-endpoint transfers are handed to the
     // same worker and run strictly in arrival order (which is submission order,
@@ -390,7 +406,7 @@ fn transfer_loop_inner(
     // transfer. Different endpoints have different workers and run concurrently,
     // so a parked IN read never blocks another endpoint. With a one-in-flight
     // importer this is identical to before: each worker only ever holds one.
-    let mut workers: HashMap<u32, mpsc::Sender<TransferRequest>> = HashMap::new();
+    let mut workers: HashMap<u32, mpsc::SyncSender<TransferRequest>> = HashMap::new();
     loop {
         let mut bytes = [0; URB_HEADER_LEN];
         reader.read_exact(&mut bytes)?;
@@ -399,30 +415,51 @@ fn transfer_loop_inner(
                 let request = read_submit_request(reader, submit)?;
                 let sequence = request.sequence;
                 let endpoint = request.endpoint;
-                lock(pending)?.insert(sequence, Pending { endpoint });
+                lock(book)?.pending.insert(sequence, Pending { endpoint });
                 if let std::collections::hash_map::Entry::Vacant(slot) = workers.entry(endpoint) {
-                    let (sender, receiver) = mpsc::channel::<TransferRequest>();
+                    let (sender, receiver) =
+                        mpsc::sync_channel::<TransferRequest>(ENDPOINT_QUEUE_DEPTH);
                     let device = Arc::clone(device);
                     let writer = Arc::clone(writer);
-                    let pending = Arc::clone(pending);
+                    let book = Arc::clone(book);
                     thread::Builder::new()
                         .name(format!("interdriver-usbip-ep-{endpoint}"))
-                        .spawn(move || endpoint_worker(&receiver, &device, &writer, &pending))?;
+                        .spawn(move || endpoint_worker(&receiver, &device, &writer, &book))?;
                     slot.insert(sender);
                 }
+                // A full queue blocks here: that is the backpressure that keeps
+                // memory bounded, and it stalls only an importer that floods one
+                // endpoint faster than the device can drain it.
                 if workers[&endpoint].send(request).is_err() {
                     // The worker is gone (only on teardown); drop the pending
                     // entry so the bookkeeping stays consistent.
-                    lock(pending)?.remove(&sequence);
+                    lock(book)?.pending.remove(&sequence);
                 }
             }
             UrbHeader::Unlink(unlink) => {
-                let removed = lock(pending)?.remove(&unlink.target_sequence);
-                let status = if let Some(pending) = removed {
-                    device.cancel(pending.endpoint);
-                    -104
-                } else {
-                    0
+                // Cancel is sequence-scoped. Removing the entry from `pending`
+                // is what actually retires the transfer: a worker that has not
+                // started it yet will skip it entirely, so it never reaches the
+                // device. Only if this exact sequence is the one running on its
+                // endpoint right now do we also tell the device to abort -- a
+                // whole-endpoint cancel for a merely-queued transfer would kill
+                // whichever *different* transfer happened to be in flight.
+                let (removed_endpoint, is_running) = {
+                    let mut book = lock(book)?;
+                    let removed = book.pending.remove(&unlink.target_sequence);
+                    let is_running = removed.as_ref().is_some_and(|entry| {
+                        book.running.get(&entry.endpoint) == Some(&unlink.target_sequence)
+                    });
+                    (removed.map(|entry| entry.endpoint), is_running)
+                };
+                let status = match removed_endpoint {
+                    Some(endpoint) => {
+                        if is_running {
+                            device.cancel(endpoint);
+                        }
+                        -104
+                    }
+                    None => 0,
                 };
                 let reply = UrbHeader::UnlinkReply(interdriver_usbip_protocol::UnlinkReply {
                     basic: BasicHeader {
@@ -450,16 +487,32 @@ fn endpoint_worker(
     receiver: &mpsc::Receiver<TransferRequest>,
     device: &Arc<dyn DeviceSession>,
     writer: &Arc<Mutex<Box<dyn Transport>>>,
-    pending: &Arc<Mutex<HashMap<u32, Pending>>>,
+    book: &Arc<Mutex<Book>>,
 ) {
     for request in receiver {
         let sequence = request.sequence;
+        let endpoint = request.endpoint;
         let direction = request.direction;
+        // Claim the transfer atomically: if the host unlinked it while it sat
+        // in the queue it is no longer in `pending`, and it must never touch the
+        // device (an OUT write here would land data the host discarded).
+        // Otherwise mark it as this endpoint's running transfer so an unlink
+        // that arrives from now on knows to abort the device.
+        {
+            let Ok(mut book) = lock(book) else { break };
+            if !book.pending.contains_key(&sequence) {
+                continue;
+            }
+            book.running.insert(endpoint, sequence);
+        }
         let completion = device.submit(request);
-        let should_reply = lock(pending)
+        let should_reply = lock(book)
             .ok()
-            .and_then(|mut pending| pending.remove(&sequence))
-            .is_some();
+            .map(|mut book| {
+                book.running.remove(&endpoint);
+                book.pending.remove(&sequence).is_some()
+            })
+            .unwrap_or(false);
         if should_reply {
             let _ = write_submit_reply(writer, sequence, direction, completion);
         }
@@ -1132,6 +1185,111 @@ mod tests {
         assert_eq!(bytes, expected, "pipelined bulk stream must reassemble in order");
 
         drop(pipeline);
+        shutdown.store(true, Ordering::Release);
+        server.join().unwrap();
+    }
+
+
+    /// Records every submit and every cancel so a test can prove what actually
+    /// reached the device. The first submit on endpoint 4 blocks until told to
+    /// finish, so a second one on the same endpoint is genuinely queued behind it.
+    #[derive(Default)]
+    struct RecordingDevice {
+        submitted: Mutex<Vec<u8>>,
+        cancels: Mutex<u32>,
+        first_started: Mutex<bool>,
+        first_started_changed: Condvar,
+        release_first: Mutex<bool>,
+        release_changed: Condvar,
+    }
+    impl DeviceSession for RecordingDevice {
+        fn submit(&self, request: TransferRequest) -> TransferCompletion {
+            let tag = request.setup[0];
+            self.submitted.lock().unwrap().push(tag);
+            if request.endpoint == 4 && tag == 0 {
+                *self.first_started.lock().unwrap() = true;
+                self.first_started_changed.notify_all();
+                let mut go = self.release_first.lock().unwrap();
+                while !*go {
+                    go = self.release_changed.wait(go).unwrap();
+                }
+            }
+            TransferCompletion {
+                status: 0, actual_length: 0, start_frame: 0, error_count: 0,
+                data: Vec::new(), iso_packets: Vec::new(),
+            }
+        }
+        fn cancel(&self, _endpoint: u32) {
+            *self.cancels.lock().unwrap() += 1;
+        }
+    }
+    struct RecordingProvider(Arc<RecordingDevice>);
+    impl DeviceProvider for RecordingProvider {
+        fn list(&self) -> io::Result<Vec<DeviceDescription>> {
+            let mut device = interdriver_usbip_protocol::DeviceRecord::new(
+                "/sys/usb/1-2", "1-2", 1, 2, 3, 0x05ac, 0x12a8,
+            ).unwrap();
+            device.interface_count = 0;
+            Ok(vec![DeviceDescription { device, interfaces: Vec::new() }])
+        }
+        fn open(&self, _bus_id: &str) -> io::Result<Arc<dyn DeviceSession>> {
+            Ok(self.0.clone())
+        }
+    }
+
+    #[test]
+    fn unlinking_a_queued_transfer_never_reaches_the_device_and_cancels_nothing_else() {
+        // The reviewer's bug: with per-endpoint queues, unlinking a transfer that
+        // is still QUEUED must (a) not run it on the device later and (b) not
+        // cancel the *different* transfer currently running on that endpoint.
+        let device = Arc::new(RecordingDevice::default());
+        let acceptor = Acceptor::bind(("127.0.0.1", 0), Duration::from_secs(1), plain()).unwrap();
+        let address = acceptor.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server_shutdown = Arc::clone(&shutdown);
+        let provider = RecordingProvider(Arc::clone(&device));
+        let server = thread::spawn(move || {
+            let _ = serve_via(Box::new(acceptor), Arc::new(provider), server_shutdown, None);
+        });
+        let session = interdriver_usbip_session::Session::connect(address, "1-2", Duration::from_secs(2)).unwrap();
+
+        // Transfer 0 on endpoint 4 starts and blocks inside the device.
+        let mut first = interdriver_usbip_session::TransferRequest::output(4, vec![0xaa]);
+        first.setup = [0, 0, 0, 0, 0, 0, 0, 0];
+        let _first = session.submit(first).unwrap();
+        {
+            let mut started = device.first_started.lock().unwrap();
+            while !*started {
+                let (next, timeout) = device.first_started_changed
+                    .wait_timeout(started, Duration::from_secs(2)).unwrap();
+                started = next;
+                assert!(!timeout.timed_out(), "first transfer did not start");
+            }
+        }
+        // Transfer 1 on the SAME endpoint is now queued behind it.
+        let mut second = interdriver_usbip_session::TransferRequest::output(4, vec![0xbb]);
+        second.setup = [1, 0, 0, 0, 0, 0, 0, 0];
+        let second_pending = session.submit(second).unwrap();
+        // Host cancels the queued one.
+        let unlink = session.unlink(second_pending.sequence).unwrap()
+            .wait_timeout(Duration::from_secs(2)).unwrap().unwrap();
+        assert_eq!(unlink.status, -104, "host must be told the transfer was cancelled");
+
+        // (b) Nothing was cancelled on the device: the running transfer (tag 0)
+        //     was NOT the one unlinked, so no whole-endpoint abort was issued.
+        assert_eq!(*device.cancels.lock().unwrap(), 0,
+            "unlinking a queued transfer must not abort the running one");
+
+        // Let the first finish; the worker will now reach the queued slot.
+        *device.release_first.lock().unwrap() = true;
+        device.release_changed.notify_all();
+        thread::sleep(Duration::from_millis(200));
+
+        // (a) The cancelled transfer never touched the device: only tag 0 ran.
+        assert_eq!(*device.submitted.lock().unwrap(), vec![0_u8],
+            "an unlinked-while-queued transfer must never be submitted to the device");
+
+        drop(session);
         shutdown.store(true, Ordering::Release);
         server.join().unwrap();
     }

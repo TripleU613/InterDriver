@@ -27,12 +27,17 @@ struct EndpointOpts {
     tls: Option<String>,
     relay: Option<String>,
     key: Option<[u8; 32]>,
+    /// Explicit, loud opt-out of encryption. Off by default: a channel that
+    /// carries pairing records and usbmux traffic must not be plaintext by
+    /// accident, so running without `--tls` requires saying so.
+    plaintext: bool,
 }
 
 impl EndpointOpts {
     fn take(args: &mut Vec<String>) -> Result<Self, String> {
         let connect = take_flag(args, "--connect");
         let tls = take_flag(args, "--tls");
+        let plaintext = take_switch(args, "--plaintext");
         let relay = take_flag(args, "--relay");
         let key = match take_flag(args, "--key") {
             Some(hex) => Some(
@@ -56,6 +61,7 @@ impl EndpointOpts {
             tls,
             relay,
             key,
+            plaintext,
         })
     }
 
@@ -63,8 +69,33 @@ impl EndpointOpts {
         if self.tls.is_some() {
             " (mutually authenticated TLS)"
         } else {
-            " (plaintext — keep it on a trusted network)"
+            " (PLAINTEXT — explicitly requested; trusted network only)"
         }
+    }
+
+    /// Encryption is the default. Refuses to build a connection with neither
+    /// `--tls` nor an explicit `--plaintext`, so nobody ships pairing traffic in
+    /// the clear by forgetting a flag.
+    fn require_encryption_decision(&self) -> Result<(), String> {
+        if self.tls.is_none() && !self.plaintext {
+            return Err(
+                "encryption is required: pass --tls <cert-dir> (create one with `tls init`), \
+                 or --plaintext to knowingly run unencrypted on a trusted network"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Removes a bare boolean switch (no value) from the args, returning whether it
+/// was present.
+fn take_switch(args: &mut Vec<String>, name: &str) -> bool {
+    if let Some(index) = args.iter().position(|arg| arg == name) {
+        args.remove(index);
+        true
+    } else {
+        false
     }
 }
 
@@ -86,6 +117,7 @@ fn accept_wrap(own_role: &str, dir: &str) -> Result<Wrap, String> {
 /// TLS identity pair, and when it dials out it verifies the importer as
 /// `importer`.
 fn exporter_connect(default_port: u16, opts: &EndpointOpts) -> Result<Box<dyn Connect>, String> {
+    opts.require_encryption_decision()?;
     if let Some(relay) = &opts.relay {
         let key = opts.key.ok_or_else(|| "--relay requires --key <hex>".to_string())?;
         let wrap = match &opts.tls {
@@ -134,6 +166,7 @@ fn host_port(remote: &str) -> String {
 /// identity pair; dialing out it verifies the exporter as `exporter`, and
 /// listening it accepts the exporter's dial as a TLS server.
 fn importer_transport(remote: &str, opts: &EndpointOpts) -> Result<Box<dyn Transport>, String> {
+    opts.require_encryption_decision()?;
     if let Some(relay) = &opts.relay {
         let key = opts.key.ok_or_else(|| "--relay requires --key <hex>".to_string())?;
         let wrap = match &opts.tls {
@@ -369,7 +402,8 @@ fn print_help() {
     println!("Connection options (any export/probe command):");
     println!("  --connect <host:port>  exporter dials the importer/relay (reverse mode, no inbound port)");
     println!("  --listen <port>        importer waits for the exporter to dial in");
-    println!("  --tls <cert-dir>       wrap the link in mutually authenticated TLS (see tls init)");
+    println!("  --tls <cert-dir>       mutually authenticated TLS (REQUIRED unless --plaintext; see tls init)");
+    println!("  --plaintext            knowingly run unencrypted on a trusted network");
     println!("  --relay <host:port> --key <hex>  both ends dial this relay; no inbound port anywhere");
 }
 
@@ -432,6 +466,7 @@ fn run_relay(port: u16, opts: &EndpointOpts) -> Result<(), String> {
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
 
+    opts.require_encryption_decision()?;
     let wrap = match &opts.tls {
         Some(dir) => accept_wrap("relay", dir)?,
         None => plain(),

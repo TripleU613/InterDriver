@@ -648,3 +648,50 @@ and an importer — three processes, all mutually authenticated over TLS, both
 device-facing ends dialing in — paired through the relay and the importer read
 the real `0c45:6340` device descriptor across the spliced pipe. Engine test
 covers the same flow on loopback.
+
+## Review round 2 — fixes and the gadget path proven (2026-09-14)
+
+The reviewer's second pass found a real bug and several correct design faults.
+Fixed and tested on Linux:
+
+- **Cancel was endpoint-scoped; now sequence-scoped.** With per-endpoint queues,
+  unlinking a still-queued transfer told the host "cancelled", aborted whatever
+  *different* transfer was running on that endpoint, and then still ran the
+  queued one on the device (an OUT write landing discarded data). The server now
+  keeps `pending` and `running` under one lock: a worker skips any transfer the
+  host unlinked while it sat in the queue (it never touches the device), and
+  the device is told to abort only when the unlinked sequence is the one
+  actually running. Regression test: queue two on one endpoint, unlink the
+  second, assert it never reached the device and no abort was issued.
+- **Bounded per-endpoint queue** (`sync_channel(32)`) instead of an unbounded
+  channel, so a fast importer can no longer push the exporter out of memory; a
+  full queue blocks the reader, which is ordinary TCP backpressure.
+- **Encryption is now the default.** `--tls <dir>` is required; running
+  unencrypted needs an explicit `--plaintext`, and the banner says so loudly.
+- **Restore is no longer silent and no longer waits for a reboot.** Every step
+  logs its outcome to `%ProgramData%\InterDriver\restore.log` and to the Application
+  Event Log; an incomplete restore keeps the manifest, reports what failed and
+  how to retry, and exits non-zero. New `windows-export run <dir> -- <args>`
+  installs, runs the exporter, and ALWAYS restores on exit (normal, Ctrl-C, or
+  exporter crash); a detached `watchdog` restores if the tool itself is killed.
+  The boot task remains only as the last resort for power loss.
+
+Still true and unchanged by this round: the Windows/macOS importer URB loops
+are serial (pipelining not enabled there); the macOS controller's periodic
+fault-and-rebuild is architectural and unaddressed; and the reviewer's concern
+that a Microsoft-signed driver bound to Apple's `VID_05AC` is a product dead end
+stands.
+
+**Gadget path proven in software (the way out of the driver problem).** With
+`dummy_hcd` + `raw_gadget` loaded, `interdriver-usb linux gadget` imported the real
+webcam over USB/IP and re-presented it on `dummy_udc.0`. The dummy host — a
+stand-in for a Windows or Mac host with no InterDriver software on it — enumerated
+it as genuine hardware (`5-1 0c45:6340 SD webcam 5160`, 480 Mb/s, 1
+configuration) and bound its own in-box class drivers: `uvcvideo` on both video
+interfaces and `snd-usb-audio` on both audio interfaces. No custom driver, no
+Apple ID in anything signed. The webcam's UVC streaming setup then stalled
+(class control `0x21/0x04` returned `-32`), which is the isochronous/altsetting
+path `gadget-approach.md` already lists as unsupported — and which an iPhone's
+bulk usbmux and control traffic does not use. Enumeration and in-box driver
+binding, the part that decides viability, are proven; next is the same run
+against a real board and a real phone.

@@ -36,15 +36,24 @@ destructive restore.
 
 ## The 60-second version
 
-Two commands. One machine exports, the other imports.
+Three commands. Make a certificate set once, then one machine exports and the
+other imports. Encryption is on by default: every link is mutually
+authenticated TLS, and the tool refuses to run unencrypted unless you say
+`--plaintext` explicitly.
 
 ```bash
-# On the machine with the device plugged in:
-interdriver-usb linux export 3-12 3240
+# Once, anywhere; copy ./certs to both machines:
+interdriver-usb tls init ./certs
 
-# On the machine that should see it:
-interdriver-usb macos attach 192.0.2.10 3-12
+# On the machine with the device plugged in (dials out, so no inbound port):
+interdriver-usb linux export 3-12 --connect 192.0.2.10:3240 --tls ./certs
+
+# On the machine that should see it (waits for the device host to dial in):
+interdriver-usb macos attach 3-12 --listen 3240 --tls ./certs
 ```
+
+On a trusted lab network you may add `--plaintext` instead of `--tls`; it is
+deliberately loud about it.
 
 `3-12` is the *port*, not the device. Whatever is plugged into that port is what
 gets carried — if the device reboots or re-enumerates, the link follows it.
