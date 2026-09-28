@@ -18,7 +18,7 @@ env:
 jobs:
   linux:
     name: linux driver
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, debiantripleu-ci]
     steps:
       - uses: actions/checkout@v4
 
@@ -53,7 +53,7 @@ jobs:
 
   windows:
     name: windows driver (cross-built on linux)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, debiantripleu-ci]
     steps:
       - uses: actions/checkout@v4
 
