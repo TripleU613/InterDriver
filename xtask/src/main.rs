@@ -1469,7 +1469,7 @@ fn enable_macos_import(root: &Path, requested_binary: Option<&Path>) -> Result<(
              1. Shut down. Hold the power button until Loading startup options.\n\
              2. Options -> Continue, then Utilities -> Terminal: csrutil disable\n\
              3. Reboot, then rerun this command.\n\n\
-             Shipping requires Apple's host-controller entitlement; see docs/apple-entitlement-request.md."
+             Shipping requires Apple's host-controller entitlement; request it from Apple via Feedback Assistant."
         );
     }
     Ok(())

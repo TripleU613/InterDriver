@@ -571,7 +571,7 @@ destructive restore/recovery/DFU cycle has not been run on this phone.
 
 ## Review-driven changes (2026-09-03)
 
-A POC review raised five points; `docs/review-response.md` answers each. The
+A POC review raised five points. The
 code changes and how far each is verified:
 
 - **Reverse connection + mTLS carrier (points 1, 5) — verified on hardware.**

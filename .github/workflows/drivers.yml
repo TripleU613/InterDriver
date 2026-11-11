@@ -6,6 +6,9 @@ name: drivers
 # cross-built on Linux with clang-cl/lld-link against WDK headers pulled from
 # NuGet, so no Visual Studio or WDK install is involved anywhere.
 
+permissions:
+  contents: read
+
 on:
   push:
     branches: [master]
@@ -18,7 +21,7 @@ env:
 jobs:
   linux:
     name: linux driver
-    runs-on: debiantripleu-ci
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -53,7 +56,7 @@ jobs:
 
   windows:
     name: windows driver (cross-built on linux)
-    runs-on: debiantripleu-ci
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -194,7 +197,6 @@ jobs:
           cp target/release/interdriver-macos-export-probe out/ 2>/dev/null || true
           cp target/release/interdriver-macos-controller-probe out/ 2>/dev/null || true
           cp crates/platform-macos/entitlements.plist out/
-          cp docs/apple-entitlement-request.md out/ 2>/dev/null || true
           ls -la out
 
       - uses: actions/upload-artifact@v4

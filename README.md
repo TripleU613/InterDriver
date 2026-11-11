@@ -1,4 +1,4 @@
-# interdriver-usb
+# InterDriver
 
 Plug a USB device into one machine and use it on another as if it were plugged in
 locally. Not a file share, not a socket proxy — the importing operating system
@@ -122,7 +122,7 @@ Leave it running. It holds the port, not the device.
 
 A user-space virtual USB host controller needs Apple's managed entitlement
 `com.apple.developer.usb.host-controller-interface`. Request it for anything you
-ship (draft in `docs/apple-entitlement-request.md` — it needs a Team ID).
+ship, via Feedback Assistant from your Apple Developer team.
 
 For development, bypass it on a **scratch Mac only**:
 

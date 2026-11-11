@@ -100,7 +100,7 @@ pre-approval development path for restricted entitlements.
 You cannot require customers to disable SIP. A distributed, notarized build
 needs Apple to approve `com.apple.developer.usb.host-controller-interface` for
 the team; then a provisioning profile carries it and it works under SIP.
-Request drafted in `docs/apple-entitlement-request.md` (needs the Team ID).
+Request it through Feedback Assistant (Problem Area: USB) with your Team ID.
 
 So: path A unblocks development and internal InterDriver use now; path B is required
 for the shipped product. They are not mutually exclusive — do A to build/test
